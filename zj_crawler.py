@@ -468,7 +468,7 @@ class ZJCrawler:
                         screenshot_filename = debug_dir / f"search_fail_{timestamp}_{url_hash}.png"
                         
                         # 截取完整页面
-                        await page.screenshot(path=str(screenshot_f ilename), full_page=True)
+                        await page.screenshot(path=str(screenshot_filename), full_page=True)
                         debug_log(f"已保存调试截图: {screenshot_filename}")
                         logger.warning(f"搜索页面无结果，已保存截图到: {screenshot_filename}")
                     except Exception as screenshot_error:
