@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Tuple, Optional
 from urllib.parse import urljoin, urlparse
 import pandas as pd
-from playwright.async_api import async_playwright, Page, Browser, BrowserContext
+from playwright.async_api import async_playwright, Page, Browser, BrowserContext, Request, Response
 import aiohttp
 import logging
 from dataclasses import dataclass
@@ -29,6 +29,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# 创建网络请求专用日志记录器
+network_logger = logging.getLogger('network')
+network_logger.setLevel(logging.DEBUG)
+network_handler = logging.FileHandler('network.log', encoding='utf-8')
+network_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+network_logger.addHandler(network_handler)
+network_logger.propagate = False  # 防止重复记录到主日志
 
 def debug_log(message: str):
     if DEBUG:
@@ -215,6 +222,7 @@ class ZJCrawler:
         self.browser: Optional[Browser] = None
         self.context: Optional[BrowserContext] = None
         self.max_concurrent_pages = max_concurrent_pages
+        self.request_count = 0  # 请求计数器
 
         self.zj_cities = {
             "杭州市": {"code": "3301", "websiteid": "330100000000000", "sitecode": "330101000000"},
@@ -231,6 +239,36 @@ class ZJCrawler:
         }
 
         self.base_url = "https://search.zj.gov.cn/jsearchfront/search.do"
+
+    def setup_network_logging(self, page: Page):
+        """为页面设置网络请求日志监听"""
+        
+        def on_request(request: Request):
+            self.request_count += 1
+            network_logger.info(f"[请求 #{self.request_count}] {request.method} {request.url}")
+            if request.post_data:
+                network_logger.debug(f"  请求体: {request.post_data[:500]}...")
+            headers = request.headers
+            if headers:
+                network_logger.debug(f"  请求头: {dict(list(headers.items())[:5])}...")
+        
+        def on_response(response: Response):
+            status = response.status
+            url = response.url
+            status_text = response.status_text
+            log_level = logging.WARNING if status >= 400 else logging.INFO
+            network_logger.log(log_level, f"[响应] {status} {status_text} - {url}")
+            if status >= 400:
+                network_logger.warning(f"  响应头: {response.headers}")
+        
+        def on_request_failed(request: Request):
+            network_logger.error(f"[请求失败] {request.method} {request.url}")
+            if request.failure:
+                network_logger.error(f"  失败原因: {request.failure}")
+        
+        page.on("request", on_request)
+        page.on("response", on_response)
+        page.on("requestfailed", on_request_failed)
 
     def load_target_cities(self, csv_file: str) -> List[str]:
         """从CSV文件加载313个目标城市列表"""
@@ -417,6 +455,9 @@ class ZJCrawler:
         """获取页面完整HTML内容，支持重试机制"""
         start_time = time.perf_counter()
         debug_log(f"开始获取页面内容: {url}")
+        
+        # 为当前页面设置网络日志
+        self.setup_network_logging(page)
         
         max_retries = 2
         retry_count = 0
@@ -680,11 +721,15 @@ class ZJCrawler:
 
         debug_log(f"开始处理城市 {city_name} 的关键词 {keyword}")
         search_page = await self.context.new_page()
+        
+        # 为搜索页面设置网络日志
+        self.setup_network_logging(search_page)
 
         try:
             while True:
                 url = self.build_search_url(city_info, keyword, page_num)
                 logger.info(f"正在爬取: {city_name} - {keyword} - 第{page_num}页")
+                network_logger.info(f"===== 开始爬取: {city_name} - {keyword} - 第{page_num}页 =====")
 
                 results = []
                 retry_count = 0
@@ -780,6 +825,7 @@ class ZJCrawler:
             await search_page.close()
 
         logger.info(f"完成 {city_name} - {keyword}: 总共{len(all_results)}条结果，已逐个保存")
+        network_logger.info(f"===== 完成 {city_name} - {keyword}: 总共{len(all_results)}条结果 =====")
         return all_results
 
     def sanitize_csv_content(self, content: str) -> str:
@@ -842,6 +888,7 @@ class ZJCrawler:
     async def run_crawler(self, cities_csv_file: str):
         """运行爬虫主程序"""
         logger.info("启动爬虫")
+        network_logger.info("===== 爬虫启动，开始记录网络请求 =====")
         
         # 从文件加载API key
         try:
@@ -901,6 +948,7 @@ class ZJCrawler:
                 try:
                     for city_name, city_info in self.zj_cities.items():
                         logger.info(f"开始处理城市: {city_name}")
+                        network_logger.info(f"===== 开始处理城市: {city_name} =====")
 
                         async with aiohttp.ClientSession(trust_env=False) as session:
                             for target_city in target_cities:
@@ -929,6 +977,7 @@ class ZJCrawler:
                                     continue
 
                         logger.info(f"完成城市: {city_name}")
+                        network_logger.info(f"===== 完成城市: {city_name} =====")
 
                 finally:
                     if self.context:
@@ -938,6 +987,7 @@ class ZJCrawler:
                     if self.browser:
                         await self.browser.close()
                         debug_log("Chromium浏览器已关闭")
+                    network_logger.info("===== 爬虫结束，网络请求记录完毕 =====")
 
 
 async def main():
