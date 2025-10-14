@@ -35,6 +35,16 @@ def debug_log(message: str):
         logger.debug(message)
 
 
+def disable_system_proxies():
+    proxy_vars = (
+        "http_proxy", "https_proxy", "ftp_proxy", "all_proxy",
+        "HTTP_PROXY", "HTTPS_PROXY", "FTP_PROXY", "ALL_PROXY"
+    )
+    cleared = [var for var in proxy_vars if os.environ.pop(var, None)]
+    if cleared:
+        logger.info(f"已清理系统代理环境变量: {', '.join(cleared)}")
+
+
 @dataclass
 class SearchResult:
     keyword: str
@@ -284,6 +294,7 @@ class ZJCrawler:
 
     def __init__(self, llm_api_key: str, max_concurrent_pages: int = 5):
         debug_log("初始化ZJCrawler")
+        disable_system_proxies()
         self.llm_client = LLMApiClient(llm_api_key)
         self.browser: Optional[Browser] = None
         self.context: Optional[BrowserContext] = None
@@ -479,7 +490,7 @@ class ZJCrawler:
                 #     debug_log("页面显示无搜索结果")
                 #     return results, total_pages
                     
-                debug_log(f"失败页面HTML关键部分: {page_html[page_html.find('<body'):page_html.find('</body>') + 7] if '<body' in page_html else page_html[:1000]}")
+                # debug_log(f"失败页面HTML关键部分: {page_html[page_html.find('<body'):page_html.find('</body>') + 7] if '<body' in page_html else page_html[:1000]}")
             except Exception as inner_exc:
                 debug_log(f"获取失败页面HTML时出错: {inner_exc}")
             logger.error(f"提取搜索结果失败: {e}")
@@ -969,7 +980,8 @@ class ZJCrawler:
                         '--disable-ipc-flooding-protection',
                         '--disable-web-security',
                         '--disable-features=VizDisplayCompositor'
-                    ]
+                    ],
+                    proxy=None
                 )
                 debug_log("Chromium浏览器已启动")
                 
@@ -993,7 +1005,7 @@ class ZJCrawler:
                     for city_name, city_info in self.zj_cities.items():
                         logger.info(f"开始处理城市: {city_name}")
 
-                        async with aiohttp.ClientSession() as session:
+                        async with aiohttp.ClientSession(trust_env=False) as session:
                             for target_city in target_cities:
                                 target_city_name = str(target_city).strip()
                                 if not target_city_name:
