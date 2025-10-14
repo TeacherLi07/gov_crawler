@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from openai import AsyncOpenAI
 from bs4 import BeautifulSoup
 
-DEBUG = 1
+DEBUG = 0
 
 logging.basicConfig(
     level=logging.DEBUG if DEBUG else logging.INFO,
@@ -295,6 +295,14 @@ class ZJCrawler:
         self.context: Optional[BrowserContext] = None
         self.max_concurrent_pages = max_concurrent_pages
         self.request_count = 0  # 请求计数器
+        
+        # 创建持久化目录用于存储缓存
+        self.cache_dir = Path("browser_cache")
+        self.cache_dir.mkdir(exist_ok=True)
+        
+        # 创建结果保存目录
+        self.results_dir = Path("results")
+        self.results_dir.mkdir(exist_ok=True)
 
         self.zj_cities = {
             "杭州市": {"code": "3301", "websiteid": "330100000000000", "sitecode": "330101000000"},
@@ -589,7 +597,9 @@ class ZJCrawler:
     async def save_single_result_to_csv(self, city_name: str, keyword: str, result: SearchResult, page_num: int = 1):
         """保存单个结果到CSV文件"""
         debug_log(f"准备保存单个结果: {city_name} - {keyword} - 第{page_num}页")
-        city_folder = Path(city_name)
+        
+        # 在results目录下创建城市文件夹
+        city_folder = self.results_dir / city_name
         city_folder.mkdir(exist_ok=True)
 
         filename = city_folder / f"{city_name}-{keyword}-news.csv"
@@ -1019,13 +1029,16 @@ class ZJCrawler:
                         '--disable-features=TranslateUI',
                         '--disable-ipc-flooding-protection',
                         '--disable-web-security',
-                        '--disable-features=VizDisplayCompositor'
+                        '--disable-features=VizDisplayCompositor',
+                        # 启用缓存相关参数
+                        f'--disk-cache-dir={self.cache_dir}',
+                        '--disk-cache-size=209715200',  # 200MB 缓存
                     ],
                     proxy=None
                 )
-                debug_log("Chromium浏览器已启动")
+                debug_log("Chromium浏览器已启动（已启用磁盘缓存）")
                 
-                # 增加浏览器上下文的并发连接限制
+                # 创建浏览器上下文，启用服务工作线程和离线缓存
                 self.context = await self.browser.new_context(
                     user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
                     viewport={"width": 1920, "height": 1080},
@@ -1033,13 +1046,17 @@ class ZJCrawler:
                     timezone_id="Asia/Shanghai",
                     java_script_enabled=True,
                     ignore_https_errors=True,
+                    # 启用服务工作线程（Service Workers）
+                    service_workers='allow',
                     extra_http_headers={
                         "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
                         "Upgrade-Insecure-Requests": "1",
-                        "DNT": "1"
+                        "DNT": "1",
+                        # 允许浏览器使用缓存
+                        "Cache-Control": "max-age=3600",
                     }
                 )
-                debug_log(f"浏览器上下文已创建，最大并发页面数: {self.max_concurrent_pages}")
+                debug_log(f"浏览器上下文已创建（启用缓存策略），最大并发页面数: {self.max_concurrent_pages}")
 
                 try:
                     for city_name, city_info in self.zj_cities.items():
