@@ -7,7 +7,7 @@ import time
 import platform
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Tuple, Optional
 from urllib.parse import urljoin, urlparse
 import pandas as pd
 from playwright.async_api import async_playwright, Page, Browser, BrowserContext
@@ -92,138 +92,52 @@ class LLMApiClient:
         # 合并文本，保留段落结构
         return '\n'.join(texts)
 
-    async def extract_content(self, html: str, url: str) -> Dict[str, str]:
-        """使用LLM提取页面标题和正文"""
-        # 优化：只推送主要含中文正文的内容
-        main_content = self.extract_main_html_content(html)
+    async def select_text_blocks(self, blocks: List[Tuple[int, str]], url: str) -> Dict[str, Any]:
+        if not blocks:
+            return {
+                "status": "error",
+                "title_indices": [],
+                "content_indices": [],
+                "message": "无可用文本块",
+                "error": "无可用文本块"
+            }
+
+        limited_blocks = blocks[:200]
+        block_lines = []
+        for idx, text in limited_blocks:
+            snippet = text if len(text) <= 120 else text[:117] + "..."
+            block_lines.append(f"{idx}. {snippet}")
+
         prompt = f"""
-        请从以下HTML内容中提取页面的标题和正文内容。只需要纯文本，忽略图片、视频、表格等。
+        请分析以下网页的中文文本片段编号列表，找出最可能作为页面主标题的编号，以及构成正文内容的编号（按阅读顺序）。
 
         要求：
-        1. title: 页面的主标题
-        2. content: 页面的正文内容，保持段落结构，去除导航、广告等无关内容
-        4. status: 成功时为"success"，失败或不确定时为"error"
-        5. message: 当status为"error"时给出简要说明，成功时可留空
+        1. title_indices: 包含标题的编号数组，通常为单个编号，如有多个按阅读顺序排列。
+        2. content_indices: 包含正文段落的编号数组，按阅读顺序排列。
+        3. status: 成功时为"success"，无法判断时为"error"。
+        4. message: 补充说明，失败时说明原因。
 
-        请严格返回以下JSON格式，不要包含其他解释文字：
-        {{"status": "success 或 error", "title": "页面标题", "content": "正文内容", "message": "补充说明"}}
+        返回格式（JSON，不要添加额外文字）：
+        {{"status": "success 或 error", "title_indices": [编号...], "content_indices": [编号...], "message": "补充说明"}}
 
-        HTML内容：
-        {main_content[:100000]}...
+        文本片段：
+        {chr(10).join(block_lines)}
 
         URL: {url}
         """
+
         debug_log(f"发送到LLM的URL: {url}")
+        debug_log(f"提供给LLM的文本块数量: {len(limited_blocks)}")
         debug_log(f"LLM提示词前200字符: {prompt[:200]}")
 
         try:
             response = await self.client.chat.completions.create(
-                model="Qwen/Qwen3-Next-80B-A3B-Instruct",
+                model="deepseek-ai/DeepSeek-V3.2-Exp",
                 messages=[
-                    {"role": "system", "content": "You are a helpful assistant designed to output JSON. 返回格式必须严格遵循用户提供的JSON结构。"},
+                    {"role": "system", "content": "You are a helpful assistant designed to output JSON."},
                     {"role": "user", "content": prompt}
                 ],
-                max_tokens=192000,
-                temperature=0.1,
-                frequency_penalty=0.05,
-                stream=True,
-                timeout=60
-            )
-
-            content = ""
-            async for chunk in response:
-                delta = chunk.choices[0].delta if chunk.choices else None
-                if delta and delta.content:
-                    fragment = delta.content
-                    content += fragment
-                    # debug_log(f"收到LLM片段长度: {len(fragment)}")
-            debug_log(f"LLM完整响应长度: {len(content)}")
-
-            if not content.strip():
-                debug_log("LLM返回空内容")
-                return {
-                    "title": "",
-                    "content": "",
-                    "status": "error",
-                    "message": "",
-                    "error": "LLM返回空内容"
-                }
-
-            try:
-                parsed = json.loads(content.strip())
-                status = (parsed.get("status") or "").lower()
-                message = parsed.get("message", "")
-                debug_log(f"LLM解析状态: {status}, message: {message}")
-                return {
-                    "title": parsed.get("title", ""),
-                    "content": parsed.get("content", ""),
-                    "status": status,
-                    "message": message,
-                    "error": "" if status == "success" else (message or "LLM返回非成功状态")
-                }
-            except json.JSONDecodeError as e:
-                logger.error(f"JSON解析失败 {url}: {e}, 原始内容: {content[:200]}")
-                return {
-                    "title": "",
-                    "content": content.strip(),
-                    "status": "error",
-                    "message": "",
-                    "error": f"JSON解析失败: {str(e)}"
-                }
-
-        except asyncio.TimeoutError:
-            error_msg = f"LLM API调用超时: {url}"
-            logger.error(error_msg)
-            return {"title": "", "content": "", "status": "error", "message": "", "error": error_msg}
-
-        except Exception as e:
-            error_msg = f"LLM API调用失败: {str(e)}"
-            logger.error(f"{error_msg} - URL: {url}")
-            return {"title": "", "content": "", "status": "error", "message": "", "error": error_msg}
-
-    async def extract_element_paths(self, html: str, url: str) -> Dict[str, any]:
-        """使用LLM分析HTML结构并返回元素路径"""
-        # 优化：只推送主要含中文正文的内容
-        main_content = self.extract_main_html_content(html)
-        prompt = f"""
-        请分析以下HTML内容的结构，找出页面标题和正文内容所在的CSS选择器路径。
-
-        要求：
-        1. title_selectors: 包含页面主标题的CSS选择器数组，可能有多个候选
-        2. content_selectors: 包含正文内容的CSS选择器数组，这些元素可能需要拼接组成完整正文
-        3. status: 成功时为"success"，失败或不确定时为"error"
-        4. message: 当status为"error"时给出简要说明，成功时可留空
-
-        注意：
-        - 标题通常在 h1, h2, .title, .article-title 等元素中
-        - 正文可能分布在多个段落 p, div, .content, .article-content 等元素中
-        - 所有content_selectors匹配的元素都会被提取并按顺序拼接
-        - CSS选择器要准确定位到实际内容，避免包含导航等无关内容
-        
-        请严格返回以下JSON格式：
-        {{
-            "status": "success 或 error",
-            "title_selectors": ["h1", ".page-title", ".article-title"],
-            "content_selectors": [".article-content p", ".content-body", "article div"],
-            "message": "补充说明"
-        }}
-
-        HTML内容：
-        {main_content[:50000]}...
-
-        URL: {url}
-        """
-        debug_log(f"发送到LLM的URL: {url}")
-        debug_log(f"LLM提示词前200字符: {prompt[:200]}")
-
-        try:
-            response = await self.client.chat.completions.create(
-                model="Qwen/Qwen3-Next-80B-A3B-Instruct",
-                messages=[
-                    {"role": "system", "content": "You are a helpful assistant designed to output JSON. 你需要分析HTML结构并返回CSS选择器路径，内容选择器用于拼接多个元素组成正文。"},
-                    {"role": "user", "content": prompt}
-                ],
-                max_tokens=4000,
+                max_tokens=2000,
                 temperature=0.1,
                 frequency_penalty=0.05,
                 stream=True,
@@ -234,17 +148,14 @@ class LLMApiClient:
             async for chunk in response:
                 delta = chunk.choices[0].delta if chunk.choices else None
                 if delta and delta.content:
-                    fragment = delta.content
-                    content += fragment
-                    debug_log(f"收到LLM片段长度: {len(fragment)}")
+                    content += delta.content
             debug_log(f"LLM完整响应长度: {len(content)}")
 
             if not content.strip():
-                debug_log("LLM返回空内容")
                 return {
                     "status": "error",
-                    "title_selectors": [],
-                    "content_selectors": [],
+                    "title_indices": [],
+                    "content_indices": [],
                     "message": "LLM返回空内容",
                     "error": "LLM返回空内容"
                 }
@@ -254,11 +165,10 @@ class LLMApiClient:
                 status = (parsed.get("status") or "").lower()
                 message = parsed.get("message", "")
                 debug_log(f"LLM解析状态: {status}, message: {message}")
-                
                 return {
                     "status": status,
-                    "title_selectors": parsed.get("title_selectors", []),
-                    "content_selectors": parsed.get("content_selectors", []),
+                    "title_indices": parsed.get("title_indices", []),
+                    "content_indices": parsed.get("content_indices", []),
                     "message": message,
                     "error": "" if status == "success" else (message or "LLM返回非成功状态")
                 }
@@ -266,8 +176,8 @@ class LLMApiClient:
                 logger.error(f"JSON解析失败 {url}: {e}, 原始内容: {content[:200]}")
                 return {
                     "status": "error",
-                    "title_selectors": [],
-                    "content_selectors": [],
+                    "title_indices": [],
+                    "content_indices": [],
                     "message": f"JSON解析失败: {str(e)}",
                     "error": f"JSON解析失败: {str(e)}"
                 }
@@ -276,16 +186,22 @@ class LLMApiClient:
             error_msg = f"LLM API调用超时: {url}"
             logger.error(error_msg)
             return {
-                "status": "error", "title_selectors": [], "content_selectors": [], 
-                "message": "", "error": error_msg
+                "status": "error",
+                "title_indices": [],
+                "content_indices": [],
+                "message": "",
+                "error": error_msg
             }
 
         except Exception as e:
             error_msg = f"LLM API调用失败: {str(e)}"
             logger.error(f"{error_msg} - URL: {url}")
             return {
-                "status": "error", "title_selectors": [], "content_selectors": [], 
-                "message": "", "error": error_msg
+                "status": "error",
+                "title_indices": [],
+                "content_indices": [],
+                "message": "",
+                "error": error_msg
             }
 
 
@@ -607,53 +523,23 @@ class ZJCrawler:
         else:
             logger.info(f"已保存结果到: {filename} (成功)")
 
-    def extract_content_by_selectors(self, html: str, title_selectors: List[str], 
-                                   content_selectors: List[str]) -> Dict[str, str]:
-        """根据CSS选择器提取页面内容，支持多个元素拼接"""
+    def extract_numbered_chinese_blocks(self, html: str, max_blocks: int = 200) -> List[Tuple[int, str]]:
         soup = BeautifulSoup(html, "lxml")
-        
-        # 提取标题 - 尝试所有候选选择器
-        title = ""
-        for selector in title_selectors:
-            try:
-                elements = soup.select(selector)
-                if elements:
-                    title = elements[0].get_text(strip=True)
-                    debug_log(f"通过选择器 {selector} 提取到标题: {title[:50]}...")
-                    break
-            except Exception as e:
-                debug_log(f"标题选择器失败 {selector}: {e}")
+        for tag in soup(['script', 'style', 'noscript', 'link', 'iframe', 'svg', 'canvas', 'meta', 'head']):
+            tag.decompose()
+        chinese_pattern = re.compile(r'[\u4e00-\u9fff]')
+        blocks: List[Tuple[int, str]] = []
+        for text in soup.stripped_strings:
+            candidate = re.sub(r'\s+', ' ', text.strip())
+            if len(candidate) < 2:
                 continue
-        
-        # 提取内容 - 拼接所有匹配的元素
-        content_parts = []
-        for selector in content_selectors:
-            try:
-                elements = soup.select(selector)
-                debug_log(f"选择器 {selector} 匹配到 {len(elements)} 个元素")
-                
-                for elem in elements:
-                    # 获取纯文本，保持段落结构
-                    text = elem.get_text(separator='\n', strip=True)
-                    if text and len(text) > 20:  # 过滤太短的内容片段
-                        content_parts.append(text)
-                        debug_log(f"通过选择器 {selector} 提取内容片段: {len(text)}字符")
-                        
-            except Exception as e:
-                debug_log(f"内容选择器失败 {selector}: {e}")
+            if not chinese_pattern.search(candidate):
                 continue
-        
-        # 拼接所有内容片段
-        content = '\n\n'.join(content_parts) if content_parts else ""
-        
-        debug_log(f"共提取到 {len(content_parts)} 个内容片段，总长度: {len(content)}字符")
-        
-        return {
-            "title": title,
-            "content": content,
-            "extracted_by": "css_selectors",
-            "content_parts_count": len(content_parts)
-        }
+            blocks.append((len(blocks) + 1, candidate))
+            if len(blocks) >= max_blocks:
+                break
+        debug_log(f"提取到中文文本块 {len(blocks)} 个")
+        return blocks
 
     async def process_single_result(self, result: SearchResult, semaphore: asyncio.Semaphore) -> SearchResult:
         """处理单个搜索结果，获取内容并使用选择器提取"""
@@ -683,39 +569,50 @@ class ZJCrawler:
                     debug_log(f"跳过处理，页面无中文内容: {result.url}")
                     return result
 
-                # HTML有效，使用LLM获取选择器路径
-                debug_log(f"开始LLM分析页面结构: {result.url}")
-                selector_result = await self.llm_client.extract_element_paths(html, result.url)
-                
-                if selector_result.get("status") != "success" or selector_result.get("error"):
-                    result.error = f"LLM分析失败: {selector_result.get('error', '未知错误')}"
-                    debug_log(f"LLM分析失败: {result.url}")
+                blocks = self.extract_numbered_chinese_blocks(html)
+                if not blocks:
+                    result.error = "页面未提取到中文文本块"
+                    debug_log(f"跳过处理，未提取到文本块: {result.url}")
                     return result
 
-                # 使用选择器提取内容
-                title_selectors = selector_result.get("title_selectors", [])
-                content_selectors = selector_result.get("content_selectors", [])
-                
-                debug_log(f"使用选择器提取内容: {result.url}")
-                debug_log(f"标题选择器: {title_selectors}")
-                debug_log(f"内容选择器: {content_selectors}")
-                
-                extracted = self.extract_content_by_selectors(html, title_selectors, content_selectors)
-                
-                result.content = extracted.get("content", "")
-                
-                # 如果原标题为空，使用提取的标题
-                if not result.title.strip() and extracted.get("title"):
-                    result.title = extracted.get("title")
-                
-                # 检查提取结果质量
-                if not result.content.strip():
-                    result.error = "选择器未能提取到有效内容"
-                elif len(result.content) < 100:
-                    result.error = "提取的内容过短，可能不完整"
-                else:
-                    debug_log(f"成功提取内容: 标题={bool(result.title)}, 正文长度={len(result.content)}, 片段数={extracted.get('content_parts_count', 0)}")
+                llm_result = await self.llm_client.select_text_blocks(blocks, result.url)
+                if llm_result.get("status") != "success":
+                    result.error = llm_result.get("error") or llm_result.get("message") or "LLM未返回成功状态"
+                    debug_log(f"LLM分析失败: {result.error}")
+                    return result
 
+                block_map = {idx: text for idx, text in blocks}
+
+                def normalize_indices(raw_indices):
+                    normalized = []
+                    for item in raw_indices or []:
+                        try:
+                            value = int(item)
+                        except (TypeError, ValueError):
+                            continue
+                        if value in block_map and value not in normalized:
+                            normalized.append(value)
+                    return normalized
+
+                title_indices = normalize_indices(llm_result.get("title_indices"))
+                content_indices = normalize_indices(llm_result.get("content_indices"))
+
+                debug_log(f"标题编号: {title_indices}, 正文编号: {content_indices}")
+
+                title_text = " ".join(block_map[idx] for idx in title_indices).strip() if title_indices else ""
+                if title_text:
+                    result.title = title_text
+
+                content_segments = [block_map[idx] for idx in content_indices]
+                result.content = "\n\n".join(content_segments).strip()
+
+                if not result.content:
+                    result.error = "LLM未返回正文编号"
+                elif len(result.content) < 100:
+                    result.error = "提取的正文过短"
+                else:
+                    debug_log(f"成功提取正文，长度 {len(result.content)} 字符，选中片段 {len(content_segments)} 个")
+                    result.error = ""
             except asyncio.TimeoutError:
                 error_msg = f"处理超时: {result.url}"
                 logger.error(error_msg)
@@ -727,8 +624,8 @@ class ZJCrawler:
             finally:
                 if page:
                     await page.close()
-                
-            return result
+            
+        return result
 
     async def process_results_individually(self, city_name: str, keyword: str, results: List[SearchResult], page_num: int) -> List[SearchResult]:
         """逐个处理搜索结果并立即保存"""
