@@ -99,6 +99,63 @@ class LLMApiClient:
         # 合并文本，保留段落结构
         return '\n'.join(texts)
 
+    def extract_json_from_response(self, content: str) -> Optional[str]:
+        """从响应中提取JSON内容，支持Markdown代码块格式"""
+        if not content:
+            return None
+        
+        content = content.strip()
+        
+        # 方法1: 查找Markdown代码块
+        # 尝试查找 ```json 或 ``` 开头的代码块
+        code_block_starts = []
+        
+        # 查找所有可能的代码块起始位置
+        json_marker = '```json'
+        triple_backtick = '```'
+        
+        # 优先查找 ```json
+        pos = content.find(json_marker)
+        if pos != -1:
+            # 找到 ```json 后面的换行符位置
+            start_pos = pos + len(json_marker)
+            # 跳过可能的空白字符
+            while start_pos < len(content) and content[start_pos] in ' \t\n\r':
+                start_pos += 1
+            code_block_starts.append(('json', start_pos))
+        else:
+            # 如果没有 ```json，查找普通的 ```
+            pos = content.find(triple_backtick)
+            if pos != -1:
+                start_pos = pos + len(triple_backtick)
+                # 跳过可能的空白字符
+                while start_pos < len(content) and content[start_pos] in ' \t\n\r':
+                    start_pos += 1
+                code_block_starts.append(('plain', start_pos))
+        
+        # 如果找到了代码块起始标记，查找结束标记
+        for block_type, start_pos in code_block_starts:
+            # 从起始位置后查找结束的 ```
+            end_pos = content.find(triple_backtick, start_pos)
+            if end_pos != -1:
+                json_str = content[start_pos:end_pos].strip()
+                if json_str:
+                    debug_log(f"从Markdown代码块({block_type})中提取JSON: {json_str[:100]}...")
+                    return json_str
+        
+        # 方法2: 查找第一个 { 和最后一个 } 之间的内容
+        first_brace = content.find('{')
+        last_brace = content.rfind('}')
+        
+        if first_brace != -1 and last_brace != -1 and first_brace < last_brace:
+            json_str = content[first_brace:last_brace + 1].strip()
+            debug_log(f"从括号中提取JSON: {json_str[:100]}...")
+            return json_str
+        
+        # 方法3: 直接返回原内容（可能已经是纯JSON）
+        debug_log("未检测到特殊格式，尝试直接解析原内容")
+        return content
+
     async def select_text_blocks(self, blocks: List[Tuple[int, str]], url: str) -> Dict[str, Any]:
         if not blocks:
             return {
@@ -167,8 +224,21 @@ class LLMApiClient:
                     "error": "LLM返回空内容"
                 }
 
+            # 使用增强的JSON提取方法
+            json_str = self.extract_json_from_response(content)
+            
+            if not json_str:
+                logger.error(f"无法从LLM响应中提取JSON {url}, 原始内容: {content[:200]}")
+                return {
+                    "status": "error",
+                    "title_indices": [],
+                    "content_indices": [],
+                    "message": "无法提取JSON内容",
+                    "error": "无法提取JSON内容"
+                }
+
             try:
-                parsed = json.loads(content.strip())
+                parsed = json.loads(json_str)
                 status = (parsed.get("status") or "").lower()
                 message = parsed.get("message", "")
                 debug_log(f"LLM解析状态: {status}, message: {message}")
@@ -180,7 +250,9 @@ class LLMApiClient:
                     "error": "" if status == "success" else (message or "LLM返回非成功状态")
                 }
             except json.JSONDecodeError as e:
-                logger.error(f"JSON解析失败 {url}: {e}, 原始内容: {content[:200]}")
+                logger.error(f"JSON解析失败 {url}: {e}")
+                logger.error(f"提取的JSON字符串: {json_str[:500]}")
+                logger.error(f"原始LLM响应: {content[:500]}")
                 return {
                     "status": "error",
                     "title_indices": [],
@@ -568,13 +640,23 @@ class ZJCrawler:
         soup = BeautifulSoup(html, "lxml")
         for tag in soup(['script', 'style', 'noscript', 'link', 'iframe', 'svg', 'canvas', 'meta', 'head']):
             tag.decompose()
-        chinese_pattern = re.compile(r'[\u4e00-\u9fff]')
+        
+        # 使用函数检查中文字符，避免正则表达式
+        def contains_chinese(text: str) -> bool:
+            for char in text:
+                if '\u4e00' <= char <= '\u9fff':
+                    return True
+            return False
+        
         blocks: List[Tuple[int, str]] = []
         for text in soup.stripped_strings:
-            candidate = re.sub(r'\s+', ' ', text.strip())
+            # 使用字符串方法替代正则表达式压缩空白
+            parts = text.strip().split()
+            candidate = ' '.join(parts)
+            
             if len(candidate) < 2:
                 continue
-            if not chinese_pattern.search(candidate):
+            if not contains_chinese(candidate):
                 continue
             blocks.append((len(blocks) + 1, candidate))
             if len(blocks) >= max_blocks:
@@ -603,9 +685,14 @@ class ZJCrawler:
                     debug_log(f"跳过处理，页面内容无效: {result.url}")
                     return result
                 
-                # 预检查HTML中是否包含中文内容
-                chinese_pattern = re.compile(r'[\u4e00-\u9fff]')
-                if not chinese_pattern.search(html):
+                # 预检查HTML中是否包含中文内容（避免正则表达式）
+                def contains_chinese(text: str) -> bool:
+                    for char in text:
+                        if '\u4e00' <= char <= '\u9fff':
+                            return True
+                    return False
+                
+                if not contains_chinese(html):
                     result.error = "页面不包含中文内容"
                     debug_log(f"跳过处理，页面无中文内容: {result.url}")
                     return result
@@ -842,8 +929,17 @@ class ZJCrawler:
         content = content.replace('"', '\\"')
         content = content.replace("'", "\\'")
         
-        # 移除其他可能的控制字符
-        content = re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]', '', content)
+        # 移除控制字符（避免正则表达式）
+        cleaned = []
+        for char in content:
+            code = ord(char)
+            # 跳过控制字符: 0x00-0x08, 0x0B, 0x0C, 0x0E-0x1F, 0x7F
+            if (0x00 <= code <= 0x08) or code == 0x0B or code == 0x0C or \
+               (0x0E <= code <= 0x1F) or code == 0x7F:
+                continue
+            cleaned.append(char)
+        
+        content = ''.join(cleaned)
         
         # 去除首尾空白字符
         content = content.strip()
