@@ -281,9 +281,9 @@ class LLMApiClient:
                         {"role": "system", "content": "You are a helpful assistant designed to output JSON."},
                         {"role": "user", "content": prompt}
                     ],
-                    max_tokens=2000,
+                    max_tokens=32768,
                     temperature=0.1,
-                    frequency_penalty=0.1,
+                    frequency_penalty=0.2,
                     stream=True,
                     timeout=30
                 )
@@ -337,6 +337,7 @@ class LLMApiClient:
                     logger.error(f"JSON解析失败 {url}: {e}")
                     logger.error(f"提取的JSON字符串: {json_str[:500]}")
                     logger.error(f"原始LLM响应: {content[:500]}")
+                    logger.error(f"使用模型: {current_model}")
                     return {
                         "status": "error",
                         "title_indices": [],
@@ -701,6 +702,15 @@ class ZJCrawler:
                 duration = time.perf_counter() - start_time
                 debug_log(f"获取页面耗时: {duration:.2f}s, HTML长度: {len(html)}")
 
+                if len(html) < 10:
+                    if retry_count < max_retries:
+                        retry_count += 2
+                        logger.warning(f"页面内容非常短 (第{retry_count/2}次重试): {url}")
+                        await asyncio.sleep(2)
+                        continue
+                    else:
+                        logger.warning(f"页面内容非常短，重试{max_retries/2}次后仍失败: {url}")
+                        return ""
                 if len(html) < 500:
                     if retry_count < max_retries:
                         retry_count += 1
@@ -1416,6 +1426,13 @@ class ZJCrawler:
                         # 启用缓存相关参数
                         f'--disk-cache-dir={self.cache_dir}',
                         '--disk-cache-size=209715200',  # 200MB 缓存
+                        # 性能优化参数
+                        '--disable-software-rasterizer',  # 禁用软件光栅化
+                        '--disable-extensions',  # 禁用扩展
+                        '--disable-plugins',  # 禁用插件
+                        '--disable-images',  # 禁用图片加载（爬取文本不需要图片）
+                        '--blink-settings=imagesEnabled=false',  # 确保图片禁用
+                        '--disable-javascript-harmony-shipping',  # 禁用实验性JS特性
                     ],
                     proxy=None
                 )
@@ -1510,7 +1527,7 @@ async def main():
     cities_csv_file = "target_cities.csv"
 
     # 不再需要手动提供API key，直接从文件读取
-    crawler = ZJCrawler("", max_concurrent_pages=30)  # API key会从文件自动加载
+    crawler = ZJCrawler("", max_concurrent_pages=80)  # API key会从文件自动加载
     await crawler.run_crawler(cities_csv_file)
 
 
