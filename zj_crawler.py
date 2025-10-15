@@ -17,6 +17,7 @@ import logging
 from dataclasses import dataclass
 from openai import AsyncOpenAI
 from bs4 import BeautifulSoup
+import shutil
 
 # 自定义 DNS 缓存映射
 DNS_OVERRIDE = {
@@ -585,7 +586,7 @@ class ZJCrawler:
         # 为当前页面设置网络日志
         self.setup_network_logging(page)
         
-        max_retries = 2
+        max_retries = 10
         retry_count = 0
         
         while retry_count <= max_retries:
@@ -594,7 +595,7 @@ class ZJCrawler:
                     debug_log(f"即将访问搜索页面 (第{retry_count + 1}次尝试): {url}")
                     await page.goto(url, wait_until='domcontentloaded', timeout=30000)
                     debug_log(f"搜索页面实际URL: {page.url}")
-                    await page.wait_for_timeout(3000)
+                    await page.wait_for_timeout(5000)
                     debug_log("搜索页面初步加载完成")
 
                 actual_url = page.url
@@ -602,7 +603,7 @@ class ZJCrawler:
                     debug_log(f"检测到跳转至: {actual_url}")
                     await page.goto(actual_url, wait_until='domcontentloaded', timeout=30000)
 
-                await page.wait_for_timeout(3000)
+                await page.wait_for_timeout(5000)
                 html = await page.content()
                 duration = time.perf_counter() - start_time
                 debug_log(f"获取页面耗时: {duration:.2f}s, HTML长度: {len(html)}")
@@ -1236,6 +1237,27 @@ class ZJCrawler:
             del self.url_cache[cache_key]
             debug_log(f"已清理URL缓存: {city_name}-{keyword}")
 
+    def cleanup_browser_cache(self):
+        """清理浏览器缓存目录"""
+        if self.cache_dir.exists():
+            try:
+                # 计算缓存目录大小
+                total_size = sum(f.stat().st_size for f in self.cache_dir.rglob('*') if f.is_file())
+                size_mb = total_size / (1024 * 1024)
+                
+                logger.info(f"开始清理浏览器缓存目录: {self.cache_dir}")
+                logger.info(f"缓存目录大小: {size_mb:.2f} MB")
+                
+                # 删除目录内所有内容
+                shutil.rmtree(self.cache_dir)
+                
+                # 重新创建空目录
+                self.cache_dir.mkdir(exist_ok=True)
+                
+                logger.info(f"浏览器缓存已清理，释放空间: {size_mb:.2f} MB")
+            except Exception as e:
+                logger.error(f"清理浏览器缓存失败: {e}")
+
     async def run_crawler(self, cities_csv_file: str):
         """运行爬虫主程序"""
         logger.info("启动爬虫")
@@ -1363,6 +1385,10 @@ class ZJCrawler:
                     if self.browser:
                         await self.browser.close()
                         debug_log("Chromium浏览器已关闭")
+                    
+                    # 清理浏览器缓存
+                    self.cleanup_browser_cache()
+                    
                     network_logger.info("===== 爬虫结束，网络请求记录完毕 =====")
 
 
