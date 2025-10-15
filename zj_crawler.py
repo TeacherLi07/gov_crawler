@@ -111,8 +111,8 @@ class LLMApiClient:
     AVAILABLE_MODELS = [
         "Qwen/Qwen3-8B",
         "deepseek-ai/DeepSeek-R1-0528-Qwen3-8B",
-        "THUDM/GLM-Z1-9B-0414",
-        "THUDM/GLM-4-9B-0414",
+        # "THUDM/GLM-Z1-9B-0414",
+        # "THUDM/GLM-4-9B-0414",
         "Qwen/Qwen2.5-7B-Instruct",
         "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
     ]
@@ -124,6 +124,11 @@ class LLMApiClient:
         )
         self.current_model_index = 0  # 当前使用的模型索引
         self.model_usage_count = {model: 0 for model in self.AVAILABLE_MODELS}  # 记录每个模型的使用次数
+        
+        # 模型切换控制
+        self.model_switch_lock = asyncio.Lock()  # 模型切换锁
+        self.last_429_model = None  # 记录最近触发429的模型
+        self.model_429_count = {model: 0 for model in self.AVAILABLE_MODELS}  # 每个模型的429错误次数
 
     async def __aenter__(self):
         debug_log("LLMApiClient进入上下文管理器")
@@ -135,6 +140,13 @@ class LLMApiClient:
         logger.info("模型使用统计:")
         for model, count in self.model_usage_count.items():
             logger.info(f"  {model}: {count} 次")
+        
+        # 输出429错误统计
+        logger.info("模型429错误统计:")
+        for model, count in self.model_429_count.items():
+            if count > 0:
+                logger.info(f"  {model}: {count} 次")
+        
         return False
 
     def get_current_model(self) -> str:
@@ -142,12 +154,37 @@ class LLMApiClient:
         return self.AVAILABLE_MODELS[self.current_model_index]
 
     def switch_to_next_model(self) -> str:
-        """切换到下一个模型"""
+        """切换到下一个模型（非线程安全，需要配合锁使用）"""
         old_model = self.get_current_model()
         self.current_model_index = (self.current_model_index + 1) % len(self.AVAILABLE_MODELS)
         new_model = self.get_current_model()
         logger.warning(f"模型切换: {old_model} -> {new_model}")
         return new_model
+
+    async def handle_rate_limit_error(self, current_model: str) -> str:
+        """处理429速率限制错误，智能切换模型"""
+        async with self.model_switch_lock:
+            # 记录429错误
+            self.model_429_count[current_model] += 1
+            
+            # 检查当前模型是否已经不是触发429的那个模型
+            # 这种情况说明其他并发请求已经切换过了
+            now_model = self.get_current_model()
+            if now_model != current_model:
+                logger.info(f"模型已被其他请求切换: {current_model} -> {now_model}，无需重复切换")
+                self.last_429_model = current_model
+                return now_model
+            
+            # 检查是否是同一个模型连续触发429
+            if self.last_429_model == current_model:
+                logger.info(f"模型 {current_model} 连续触发429，直接使用当前模型")
+                return current_model
+            
+            # 执行切换
+            self.last_429_model = self.switch_to_next_model()
+            logger.warning(f"429错误触发模型切换: {current_model} -> {self.last_429_model}")
+            
+            return self.last_429_model
 
     def extract_main_html_content(self, html: str) -> str:
         """
@@ -240,30 +277,34 @@ class LLMApiClient:
             snippet = text if len(text) <= 120 else text[:117] + "..."
             block_lines.append(f"{idx}. {snippet}")
 
-        prompt = f"""
-        请分析以下网页的中文文本片段编号列表，找出最可能作为页面主标题的编号，以及构成正文内容的编号（按阅读顺序）。
+        prompt = f"""请分析以下网页文本片段，找出其中的【标题编号】和【正文编号】。
 
-        要求：
-        1. title_indices: 包含标题的编号数组，通常为单个编号，如有多个按阅读顺序排列。
-        2. content_indices: 包含正文段落的编号数组，按阅读顺序排列。
-        3. status: 成功时为"success"，无法判断时为"error"。
-        4. message: 失败时说明原因。
+编号格式说明：
+- 单个编号：`[5]`
+- 如有连续同类文本块，可采用区间编号：`[[5,10]]` 表示编号5到10（含端点）
+- 也可混合使用：`[[1,3], 8, [15,45]]` 
 
-        返回格式（JSON，不要添加额外文字）：
-        {{"status": "success 或 error", "title_indices": [编号...], "content_indices": [编号...], "message": "补充说明"}}
+输出要求：
+1. `title_indices`：标题的编号（通常只有一个编号或一个连续区间）
+2. `content_indices`：正文的编号（可能包含多个编号或区间，按顺序排列）
+3. `status`：仅允许 `"success"` 或 `"error"`
+4. `message`：若出错，请简要说明原因；否则为空字符串
 
-        文本片段：
-        {chr(10).join(block_lines)}
+输出格式要求：
+仅返回一个合法的 JSON 对象，格式如下：
+{{"status":"success", "title_indices":编号, "content_indices":编号, "message":""}}
+请不要输出额外说明、解释或注释。
 
-        URL: {url}
-        """
+待分析的文本片段：
+{chr(10).join(block_lines)}
+"""
 
         debug_log(f"发送到LLM的URL: {url}")
         debug_log(f"提供给LLM的文本块数量: {len(limited_blocks)}")
         debug_log(f"LLM提示词前200字符: {prompt[:200]}")
 
         # 最多重试次数（用于非 429 错误）
-        max_retries = 5
+        max_retries = 10
         retry_count = 0
         # 429 错误的循环轮换次数（无限制，直到成功或遇到其他错误）
         rate_limit_cycle_count = 0
@@ -281,9 +322,9 @@ class LLMApiClient:
                         {"role": "system", "content": "You are a helpful assistant designed to output JSON."},
                         {"role": "user", "content": prompt}
                     ],
-                    max_tokens=32768,
-                    temperature=0.1,
-                    frequency_penalty=0.2,
+                    max_tokens=1024,
+                    temperature=0.2,
+                    frequency_penalty=0.15,
                     stream=True,
                     timeout=30
                 )
@@ -369,9 +410,8 @@ class LLMApiClient:
                 if "429" in error_str or "rate_limit" in error_str.lower() or "too many requests" in error_str.lower():
                     logger.warning(f"模型 {current_model} 遇到速率限制 (429)")
                     
-                    # 切换到下一个模型
-                    old_model = current_model
-                    new_model = self.switch_to_next_model()
+                    # 使用新的智能切换方法
+                    new_model = await self.handle_rate_limit_error(current_model)
                     
                     # 记录轮换次数
                     rate_limit_cycle_count += 1
@@ -879,14 +919,28 @@ class ZJCrawler:
                 block_map = {idx: text for idx, text in blocks}
 
                 def normalize_indices(raw_indices):
+                    """解析索引，支持区间表示法"""
                     normalized = []
                     for item in raw_indices or []:
-                        try:
-                            value = int(item)
-                        except (TypeError, ValueError):
-                            continue
-                        if value in block_map and value not in normalized:
-                            normalized.append(value)
+                        # 处理区间 [start, end]
+                        if isinstance(item, list) and len(item) == 2:
+                            try:
+                                start, end = int(item[0]), int(item[1])
+                                for idx in range(start, end + 1):
+                                    if idx in block_map and idx not in normalized:
+                                        normalized.append(idx)
+                            except (TypeError, ValueError) as e:
+                                debug_log(f"解析区间失败 {item}: {e}")
+                                continue
+                        # 处理单个编号
+                        else:
+                            try:
+                                value = int(item)
+                                if value in block_map and value not in normalized:
+                                    normalized.append(value)
+                            except (TypeError, ValueError) as e:
+                                debug_log(f"解析单个编号失败 {item}: {e}")
+                                continue
                     return normalized
 
                 title_indices = normalize_indices(llm_result.get("title_indices"))
@@ -1036,7 +1090,7 @@ class ZJCrawler:
 
     async def process_single_city_keyword(self, city_name: str, city_info: Dict,
                                           keyword: str, session: aiohttp.ClientSession) -> List[SearchResult]:
-        """处理单个城市的单个关键词搜索 - 并行爬取版本"""
+        """处理单个城市的单个关键词搜索 - 并行爬取版本（优化搜索页并行）"""
         all_results = []
         
         # 加载已存在的URL（只加载一次，后续使用缓存）
@@ -1049,69 +1103,82 @@ class ZJCrawler:
         
         # 搜索页爬取状态
         search_state = {
-            'current_page': 1,
             'max_pages': None,
             'search_finished': False,
+            'pages_fetched': set(),  # 已爬取的页码
         }
+        
+        # 创建信号量限制搜索页的并发数
+        search_page_semaphore = asyncio.Semaphore(3)  # 最多3个搜索页并行
+
+        async def fetch_single_search_page(page_num: int):
+            """获取单个搜索页并将结果放入队列"""
+            async with search_page_semaphore:
+                try:
+                    # 检查是否已爬取
+                    if page_num in search_state['pages_fetched']:
+                        debug_log(f"跳过已爬取的搜索页: 第{page_num}页")
+                        return
+                    
+                    results, total_pages = await self.fetch_search_page(
+                        city_info, keyword, page_num
+                    )
+                    
+                    # 标记为已爬取
+                    search_state['pages_fetched'].add(page_num)
+                    
+                    # 更新最大页数
+                    if search_state['max_pages'] is None and total_pages > 0:
+                        search_state['max_pages'] = total_pages
+                        logger.info(f"{city_name} - {keyword}: 共{total_pages}页")
+                    
+                    # 如果没有结果，记录但不中断其他页
+                    if not results:
+                        logger.warning(f"第{page_num}页无搜索结果")
+                        return
+                    
+                    # 将结果放入队列
+                    for result in results:
+                        await results_queue.put((page_num, result))
+                    
+                    logger.info(f"已将第{page_num}页的 {len(results)} 个结果加入队列")
+                    
+                except Exception as e:
+                    logger.error(f"爬取搜索页第{page_num}页失败: {e}")
 
         async def search_page_producer():
-            """生产者：持续爬取搜索页并将结果放入队列"""
+            """生产者：并行爬取多个搜索页"""
             try:
-                while not search_state['search_finished']:
-                    current_page = search_state['current_page']
-                    
-                    # 检查是否已到达最大页数
-                    if search_state['max_pages'] and current_page > search_state['max_pages']:
-                        logger.info(f"已达到最大页数 {search_state['max_pages']}，停止爬取搜索页")
-                        search_state['search_finished'] = True
-                        break
-                    
-                    # 检查队列中剩余结果数
-                    # 如果队列中结果数 >= max_concurrent_pages，暂停爬取
-                    queue_size = results_queue.qsize()
-                    if queue_size >= self.max_concurrent_pages:
-                        logger.info(f"队列中有 {queue_size} 个结果待处理，暂停搜索页爬取")
-                        await asyncio.sleep(2)
-                        continue
-                    
-                    # 爬取当前页
-                    try:
-                        results, total_pages = await self.fetch_search_page(
-                            city_info, keyword, current_page
-                        )
-                        
-                        # 更新最大页数
-                        if search_state['max_pages'] is None and total_pages > 0:
-                            search_state['max_pages'] = total_pages
-                            logger.info(f"{city_name} - {keyword}: 共{total_pages}页")
-                        
-                        # 如果没有结果，停止搜索
-                        if not results:
-                            logger.warning(f"第{current_page}页无搜索结果，停止搜索")
-                            search_state['search_finished'] = True
-                            break
-                        
-                        # 将结果放入队列
-                        for result in results:
-                            await results_queue.put((current_page, result))
-                        
-                        logger.info(f"已将第{current_page}页的 {len(results)} 个结果加入队列，队列大小: {results_queue.qsize()}")
-                        
-                        # 移动到下一页
-                        search_state['current_page'] += 1
-                        
-                        # 短暂延迟
-                        await asyncio.sleep(1)
-                        
-                    except Exception as e:
-                        logger.error(f"爬取搜索页第{current_page}页失败: {e}")
-                        search_state['search_finished'] = True
-                        break
+                # 先爬取第一页获取总页数
+                await fetch_single_search_page(1)
+                await asyncio.sleep(1)  # 短暂延迟
                 
+                # 如果有总页数，启动并行爬取
+                if search_state['max_pages']:
+                    # 创建并行任务列表
+                    tasks = []
+                    for page_num in range(2, search_state['max_pages'] + 1):
+                        task = asyncio.create_task(fetch_single_search_page(page_num))
+                        tasks.append(task)
+                        
+                        # 每启动3个任务后短暂延迟，避免过载
+                        if len(tasks) % 3 == 0:
+                            await asyncio.sleep(0.5)
+                    
+                    # 等待所有搜索页爬取完成
+                    if tasks:
+                        await asyncio.gather(*tasks, return_exceptions=True)
+                
+                search_state['search_finished'] = True
                 logger.info("搜索页生产者任务完成")
                 
+            except Exception as e:
+                logger.error(f"搜索页生产者异常: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
+                search_state['search_finished'] = True
             finally:
-                # 发送完成信号（放入 None）
+                # 发送完成信号
                 await results_queue.put((None, None))
 
         async def result_consumer():
@@ -1527,7 +1594,7 @@ async def main():
     cities_csv_file = "target_cities.csv"
 
     # 不再需要手动提供API key，直接从文件读取
-    crawler = ZJCrawler("", max_concurrent_pages=80)  # API key会从文件自动加载
+    crawler = ZJCrawler("", max_concurrent_pages=120)  # API key会从文件自动加载
     await crawler.run_crawler(cities_csv_file)
 
 
