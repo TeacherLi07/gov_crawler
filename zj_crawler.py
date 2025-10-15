@@ -5,6 +5,7 @@ import os
 import re
 import time
 import platform
+import socket
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Tuple, Optional
@@ -16,6 +17,30 @@ import logging
 from dataclasses import dataclass
 from openai import AsyncOpenAI
 from bs4 import BeautifulSoup
+
+# 自定义 DNS 缓存映射
+DNS_OVERRIDE = {
+    'zfwzgl.www.gov.cn': '36.112.20.164',
+    # 可以添加更多需要覆盖的域名
+}
+
+# 保存原始的 getaddrinfo 函数
+_original_getaddrinfo = socket.getaddrinfo
+
+def custom_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+    """自定义 DNS 解析函数，优先使用本地缓存"""
+    # 检查是否在覆盖列表中
+    if host in DNS_OVERRIDE:
+        override_ip = DNS_OVERRIDE[host]
+        logger.info(f"DNS覆盖: {host} -> {override_ip}")
+        # 返回自定义的 IP 地址
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, '', (override_ip, port))]
+    
+    # 否则使用原始的解析函数
+    return _original_getaddrinfo(host, port, family, type, proto, flags)
+
+# 应用 DNS 覆盖
+socket.getaddrinfo = custom_getaddrinfo
 
 DEBUG = 0
 
@@ -50,7 +75,12 @@ def disable_system_proxies():
     cleared = [var for var in proxy_vars if os.environ.pop(var, None)]
     if cleared:
         logger.info(f"已清理系统代理环境变量: {', '.join(cleared)}")
-
+    
+    # 输出 DNS 覆盖信息
+    if DNS_OVERRIDE:
+        logger.info(f"已启用 DNS 本地缓存覆盖，共 {len(DNS_OVERRIDE)} 条规则:")
+        for domain, ip in DNS_OVERRIDE.items():
+            logger.info(f"  {domain} -> {ip}")
 
 @dataclass
 class SearchResult:
@@ -769,8 +799,8 @@ class ZJCrawler:
 
                 if not result.content:
                     result.error = "LLM未返回正文编号"
-                elif len(result.content) < 100:
-                    result.error = "提取的正文过短"
+                # elif len(result.content) < 100:
+                #     result.error = "提取的正文过短"
                 else:
                     debug_log(f"成功提取正文，长度 {len(result.content)} 字符，选中片段 {len(content_segments)} 个")
                     result.error = ""
