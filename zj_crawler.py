@@ -888,6 +888,9 @@ class ZJCrawler:
         # 为搜索页面设置网络日志
         self.setup_network_logging(search_page)
 
+        # 预加载任务：存储下一页的搜索结果
+        next_page_task = None
+
         try:
             while True:
                 url = self.build_search_url(city_info, keyword, page_num)
@@ -895,68 +898,81 @@ class ZJCrawler:
                 network_logger.info(f"===== 开始爬取: {city_name} - {keyword} - 第{page_num}页 =====")
 
                 results = []
+                total_pages = 0  # 添加初始化
                 retry_count = 0
                 max_retries = 3
                 
-                # 获取搜索结果页面（保持原有逻辑）
-                while retry_count < max_retries:
+                # 如果有预加载的下一页任务，等待它完成
+                if next_page_task:
                     try:
-                        debug_log(f"尝试访问页面 (第{retry_count + 1}次): {url}")
-                        
-                        # 设置额外的请求头
-                        await search_page.set_extra_http_headers({
-                            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
-                            "Accept-Encoding": "gzip, deflate, br",
-                            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-                            "Cache-Control": "max-age=0",
-                            "Connection": "keep-alive",
-                            "DNT": "1",
-                            "Sec-Fetch-Dest": "document",
-                            "Sec-Fetch-Mode": "navigate",
-                            "Sec-Fetch-Site": "none",
-                            "Sec-Fetch-User": "?1",
-                            "Upgrade-Insecure-Requests": "1",
-                            "sec-ch-ua": '"Google Chrome";v="124", "Chromium";v="124", "Not-A.Brand";v="99"',
-                            "sec-ch-ua-mobile": "?0",
-                            "sec-ch-ua-platform": '"Windows"'
-                        })
-                        
-                        await search_page.goto(url, wait_until='networkidle', timeout=30000)
-                        debug_log(f"页面加载完成，当前URL: {search_page.url}")
-                        
-                        # 额外等待确保页面完全渲染
-                        await search_page.wait_for_timeout(3000)
-                        
-                        # 检查页面是否正常加载
-                        page_title = await search_page.title()
-                        debug_log(f"页面标题: {page_title}")
-                        
-                        # 尝试滚动页面以触发懒加载
-                        await search_page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                        await search_page.wait_for_timeout(1000)
-                        await search_page.evaluate("window.scrollTo(0, 0)")
-                        await search_page.wait_for_timeout(1000)
-
-                        results, total_pages = await self.extract_search_results(search_page)
-                        
-                        if not results and retry_count < max_retries - 1:
-                            debug_log(f"第{retry_count + 1}次尝试无结果，{2}秒后重试")
-                            await asyncio.sleep(2)
-                            retry_count += 1
-                            continue
-                        else:
-                            break
-
+                        results, total_pages = await next_page_task
+                        logger.info(f"使用预加载的第{page_num}页结果，共{len(results)}条")
+                        next_page_task = None  # 重置任务标记
                     except Exception as e:
-                        retry_count += 1
-                        error_msg = f"访问页面失败 (第{retry_count}次): {str(e)}"
-                        logger.warning(error_msg)
-                        
-                        if retry_count >= max_retries:
-                            logger.error(f"重试{max_retries}次后仍然失败: {url}")
-                            break
-                        else:
-                            await asyncio.sleep(3)
+                        logger.error(f"预加载任务失败: {e}，重新获取")
+                        next_page_task = None
+                
+                # 如果没有预加载结果，正常获取
+                if not results:
+                    # 获取搜索结果页面（保持原有逻辑）
+                    while retry_count < max_retries:
+                        try:
+                            debug_log(f"尝试访问页面 (第{retry_count + 1}次): {url}")
+                            
+                            # 设置额外的请求头
+                            await search_page.set_extra_http_headers({
+                                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+                                "Accept-Encoding": "gzip, deflate, br",
+                                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+                                "Cache-Control": "max-age=0",
+                                "Connection": "keep-alive",
+                                "DNT": "1",
+                                "Sec-Fetch-Dest": "document",
+                                "Sec-Fetch-Mode": "navigate",
+                                "Sec-Fetch-Site": "none",
+                                "Sec-Fetch-User": "?1",
+                                "Upgrade-Insecure-Requests": "1",
+                                "sec-ch-ua": '"Google Chrome";v="124", "Chromium";v="124", "Not-A.Brand";v="99"',
+                                "sec-ch-ua-mobile": "?0",
+                                "sec-ch-ua-platform": '"Windows"'
+                            })
+                            
+                            await search_page.goto(url, wait_until='networkidle', timeout=30000)
+                            debug_log(f"页面加载完成，当前URL: {search_page.url}")
+                            
+                            # 额外等待确保页面完全渲染
+                            await search_page.wait_for_timeout(3000)
+                            
+                            # 检查页面是否正常加载
+                            page_title = await search_page.title()
+                            debug_log(f"页面标题: {page_title}")
+                            
+                            # 尝试滚动页面以触发懒加载
+                            await search_page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                            await search_page.wait_for_timeout(1000)
+                            await search_page.evaluate("window.scrollTo(0, 0)")
+                            await search_page.wait_for_timeout(1000)
+
+                            results, total_pages = await self.extract_search_results(search_page)
+                            
+                            if not results and retry_count < max_retries - 1:
+                                debug_log(f"第{retry_count + 1}次尝试无结果，{2}秒后重试")
+                                await asyncio.sleep(2)
+                                retry_count += 1
+                                continue
+                            else:
+                                break
+
+                        except Exception as e:
+                            retry_count += 1
+                            error_msg = f"访问页面失败 (第{retry_count}次): {str(e)}"
+                            logger.warning(error_msg)
+                            
+                            if retry_count >= max_retries:
+                                logger.error(f"重试{max_retries}次后仍然失败: {url}")
+                                break
+                            else:
+                                await asyncio.sleep(3)
 
                 if not results:
                     logger.warning(f"第{page_num}页无搜索结果，结束该关键词搜索")
@@ -966,7 +982,67 @@ class ZJCrawler:
                 for result in results:
                     result.keyword = keyword
 
-                # **逐个处理搜索结果内容提取并立即保存**
+                # **立即开始预加载下一页（如果还有下一页）**
+                if max_pages is None and total_pages > 0:
+                    max_pages = total_pages
+                    logger.info(f"{city_name} - {keyword}: 共{max_pages}页")
+                
+                # 判断是否需要预加载下一页
+                should_preload = (max_pages is None or page_num < max_pages)
+                if should_preload:
+                    next_page_num = page_num + 1
+                    next_url = self.build_search_url(city_info, keyword, next_page_num)
+                    
+                    # 定义预加载函数（使用闭包捕获变量）
+                    async def create_preload_task():
+                        preload_page = await self.context.new_page()
+                        self.setup_network_logging(preload_page)
+                        
+                        try:
+                            logger.info(f"开始预加载第{next_page_num}页")
+                            
+                            await preload_page.set_extra_http_headers({
+                                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+                                "Accept-Encoding": "gzip, deflate, br",
+                                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+                                "Cache-Control": "max-age=0",
+                                "Connection": "keep-alive",
+                                "DNT": "1",
+                                "Sec-Fetch-Dest": "document",
+                                "Sec-Fetch-Mode": "navigate",
+                                "Sec-Fetch-Site": "none",
+                                "Sec-Fetch-User": "?1",
+                                "Upgrade-Insecure-Requests": "1",
+                                "sec-ch-ua": '"Google Chrome";v="124", "Chromium";v="124", "Not-A.Brand";v="99"',
+                                "sec-ch-ua-mobile": "?0",
+                                "sec-ch-ua-platform": '"Windows"'
+                            })
+                            
+                            await preload_page.goto(next_url, wait_until='networkidle', timeout=30000)
+                            await preload_page.wait_for_timeout(3000)
+                            await preload_page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                            await preload_page.wait_for_timeout(1000)
+                            await preload_page.evaluate("window.scrollTo(0, 0)")
+                            await preload_page.wait_for_timeout(1000)
+                            
+                            next_results, next_total = await self.extract_search_results(preload_page)
+                            logger.info(f"预加载第{next_page_num}页完成，获取{len(next_results)}条结果")
+                            
+                            # 关闭当前搜索页，替换为预加载页
+                            nonlocal search_page
+                            await search_page.close()
+                            search_page = preload_page
+                            
+                            return next_results, next_total
+                        except Exception as e:
+                            logger.error(f"预加载第{next_page_num}页失败: {e}")
+                            await preload_page.close()
+                            raise
+                    
+                    # 创建预加载任务
+                    next_page_task = asyncio.create_task(create_preload_task())
+
+                # **逐个处理当前页搜索结果内容提取并立即保存**
                 logger.info(f"开始逐个处理第{page_num}页的{len(results)}个搜索结果")
                 processed_results = await self.process_results_individually(
                     city_name, keyword, results, page_num, existing_urls
@@ -975,18 +1051,29 @@ class ZJCrawler:
                 all_results.extend(processed_results)
                 debug_log(f"第{page_num}页已处理完成，累计结果数量: {len(all_results)}")
 
-                if max_pages is None and total_pages > 0:
-                    max_pages = total_pages
-                    logger.info(f"{city_name} - {keyword}: 共{max_pages}页")
-
                 if max_pages and page_num >= max_pages:
                     debug_log("达到最大页数，结束分页")
+                    # 取消未完成的预加载任务
+                    if next_page_task and not next_page_task.done():
+                        next_page_task.cancel()
+                        try:
+                            await next_page_task
+                        except asyncio.CancelledError:
+                            pass
                     break
 
                 page_num += 1
                 await asyncio.sleep(1)
 
         finally:
+            # 清理预加载任务
+            if next_page_task and not next_page_task.done():
+                next_page_task.cancel()
+                try:
+                    await next_page_task
+                except asyncio.CancelledError:
+                    pass
+            
             await search_page.close()
 
         logger.info(f"完成 {city_name} - {keyword}: 总共{len(all_results)}条结果，已逐个保存")
