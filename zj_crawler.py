@@ -64,6 +64,15 @@ class SearchResult:
     error: str = ""
 
 
+@dataclass
+class CrawlProgress:
+    """爬取进度记录"""
+    source_city: str
+    target_city: str
+    completed: bool = False
+    last_update: str = ""
+
+
 class LLMApiClient:
     """LLM API客户端，使用OpenAI SDK调用SiliconFlow服务"""
 
@@ -179,7 +188,7 @@ class LLMApiClient:
         1. title_indices: 包含标题的编号数组，通常为单个编号，如有多个按阅读顺序排列。
         2. content_indices: 包含正文段落的编号数组，按阅读顺序排列。
         3. status: 成功时为"success"，无法判断时为"error"。
-        4. message: 补充说明，失败时说明原因。
+        4. message: 失败时说明原因。
 
         返回格式（JSON，不要添加额外文字）：
         {{"status": "success 或 error", "title_indices": [编号...], "content_indices": [编号...], "message": "补充说明"}}
@@ -196,14 +205,14 @@ class LLMApiClient:
 
         try:
             response = await self.client.chat.completions.create(
-                model="deepseek-ai/DeepSeek-V3.2-Exp",
+                model="Qwen/Qwen3-8B",
                 messages=[
                     {"role": "system", "content": "You are a helpful assistant designed to output JSON."},
                     {"role": "user", "content": prompt}
                 ],
                 max_tokens=2000,
                 temperature=0.1,
-                frequency_penalty=0.05,
+                frequency_penalty=0.1,
                 stream=True,
                 timeout=30
             )
@@ -303,6 +312,13 @@ class ZJCrawler:
         # 创建结果保存目录
         self.results_dir = Path("results")
         self.results_dir.mkdir(exist_ok=True)
+        
+        # 进度文件路径
+        self.progress_file = Path("crawl_progress.json")
+        
+        # URL缓存：缓存已处理的URL，避免重复加载CSV
+        # 格式: {(city_name, keyword): set(urls)}
+        self.url_cache: Dict[Tuple[str, str], set] = {}
 
         self.zj_cities = {
             "杭州市": {"code": "3301", "websiteid": "330100000000000", "sitecode": "330101000000"},
@@ -674,8 +690,15 @@ class ZJCrawler:
         debug_log(f"提取到中文文本块 {len(blocks)} 个")
         return blocks
 
-    async def process_single_result(self, result: SearchResult, semaphore: asyncio.Semaphore) -> SearchResult:
+    async def process_single_result(self, result: SearchResult, semaphore: asyncio.Semaphore, 
+                                     existing_urls: set, city_name: str, keyword: str) -> SearchResult:
         """处理单个搜索结果，获取内容并使用选择器提取"""
+        # 检查URL是否已存在
+        if result.url in existing_urls:
+            result.error = "URL已存在，跳过处理"
+            logger.info(f"跳过已存在的URL: {result.url}")
+            return result
+        
         async with semaphore:
             page = None
             try:
@@ -751,6 +774,9 @@ class ZJCrawler:
                 else:
                     debug_log(f"成功提取正文，长度 {len(result.content)} 字符，选中片段 {len(content_segments)} 个")
                     result.error = ""
+                    # 成功处理后，将URL添加到缓存
+                    self.add_url_to_cache(city_name, keyword, result.url)
+                    
             except asyncio.TimeoutError:
                 error_msg = f"处理超时: {result.url}"
                 logger.error(error_msg)
@@ -765,7 +791,9 @@ class ZJCrawler:
             
         return result
 
-    async def process_results_individually(self, city_name: str, keyword: str, results: List[SearchResult], page_num: int) -> List[SearchResult]:
+    async def process_results_individually(self, city_name: str, keyword: str, 
+                                           results: List[SearchResult], page_num: int,
+                                           existing_urls: set) -> List[SearchResult]:
         """逐个处理搜索结果并立即保存"""
         if not results:
             return results
@@ -779,7 +807,9 @@ class ZJCrawler:
         # 创建任务列表但不立即执行全部
         tasks = []
         for result in results:
-            task = asyncio.create_task(self.process_single_result(result, semaphore))
+            task = asyncio.create_task(
+                self.process_single_result(result, semaphore, existing_urls, city_name, keyword)
+            )
             tasks.append(task)
         
         # 逐个等待任务完成并立即保存
@@ -788,10 +818,12 @@ class ZJCrawler:
                 processed_result = await task
                 processed_results.append(processed_result)
                 
-                # 立即保存单个结果
-                await self.save_single_result_to_csv(city_name, keyword, processed_result, page_num)
-                
-                debug_log(f"已处理并保存第{i}/{len(results)}个结果")
+                # 只保存非跳过的结果
+                if processed_result.error != "URL已存在，跳过处理":
+                    await self.save_single_result_to_csv(city_name, keyword, processed_result, page_num)
+                    debug_log(f"已处理并保存第{i}/{len(results)}个结果")
+                else:
+                    debug_log(f"已跳过第{i}/{len(results)}个结果（URL已存在）")
                 
             except Exception as e:
                 logger.error(f"处理第{i}个结果时出现异常: {e}")
@@ -804,8 +836,9 @@ class ZJCrawler:
                 await self.save_single_result_to_csv(city_name, keyword, error_result, page_num)
 
         success_count = len([r for r in processed_results if not r.error])
-        error_count = len(processed_results) - success_count
-        debug_log(f"逐个处理完成: 成功{success_count}个, 失败{error_count}个")
+        skip_count = len([r for r in processed_results if r.error == "URL已存在，跳过处理"])
+        error_count = len(processed_results) - success_count - skip_count
+        logger.info(f"逐个处理完成: 成功{success_count}个, 跳过{skip_count}个, 失败{error_count}个")
         
         return processed_results
 
@@ -816,7 +849,10 @@ class ZJCrawler:
         page_num = 1
         max_pages = None
 
-        debug_log(f"开始处理城市 {city_name} 的关键词 {keyword}")
+        # 加载已存在的URL（只加载一次，后续使用缓存）
+        existing_urls = self.load_existing_urls(city_name, keyword)
+
+        debug_log(f"开始处理城市 {city_name} 的关键词 {keyword}，已有URL数量: {len(existing_urls)}")
         search_page = await self.context.new_page()
         
         # 为搜索页面设置网络日志
@@ -902,7 +938,9 @@ class ZJCrawler:
 
                 # **逐个处理搜索结果内容提取并立即保存**
                 logger.info(f"开始逐个处理第{page_num}页的{len(results)}个搜索结果")
-                processed_results = await self.process_results_individually(city_name, keyword, results, page_num)
+                processed_results = await self.process_results_individually(
+                    city_name, keyword, results, page_num, existing_urls
+                )
                 
                 all_results.extend(processed_results)
                 debug_log(f"第{page_num}页已处理完成，累计结果数量: {len(all_results)}")
@@ -991,6 +1029,96 @@ class ZJCrawler:
             logger.error(f"读取API key失败: {e}")
             raise
 
+    def load_progress(self) -> Dict[str, Dict[str, bool]]:
+        """加载爬取进度"""
+        if not self.progress_file.exists():
+            logger.info("未找到进度文件，将从头开始爬取")
+            return {}
+        
+        try:
+            with open(self.progress_file, 'r', encoding='utf-8') as f:
+                progress_data = json.load(f)
+            logger.info(f"已加载进度文件，包含 {len(progress_data)} 个源城市的记录")
+            return progress_data
+        except Exception as e:
+            logger.error(f"加载进度文件失败: {e}，将从头开始爬取")
+            return {}
+
+    def save_progress(self, progress: Dict[str, Dict[str, bool]]):
+        """保存爬取进度"""
+        try:
+            with open(self.progress_file, 'w', encoding='utf-8') as f:
+                json.dump(progress, f, ensure_ascii=False, indent=2)
+            debug_log(f"已保存进度到: {self.progress_file}")
+        except Exception as e:
+            logger.error(f"保存进度文件失败: {e}")
+
+    def is_city_pair_completed(self, progress: Dict[str, Dict[str, bool]], 
+                                source_city: str, target_city: str) -> bool:
+        """检查城市对是否已完成"""
+        if source_city not in progress:
+            return False
+        return progress[source_city].get(target_city, False)
+
+    def mark_city_pair_completed(self, progress: Dict[str, Dict[str, bool]], 
+                                  source_city: str, target_city: str):
+        """标记城市对为已完成"""
+        if source_city not in progress:
+            progress[source_city] = {}
+        progress[source_city][target_city] = True
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        logger.info(f"标记完成: {source_city} -> {target_city} (时间: {timestamp})")
+        # 立即保存进度
+        self.save_progress(progress)
+
+    def load_existing_urls(self, city_name: str, keyword: str) -> set:
+        """从CSV文件加载已存在的URL集合，使用缓存优化性能"""
+        cache_key = (city_name, keyword)
+        
+        # 检查缓存
+        if cache_key in self.url_cache:
+            debug_log(f"从缓存获取URL集合: {city_name}-{keyword}, 数量: {len(self.url_cache[cache_key])}")
+            return self.url_cache[cache_key]
+        
+        # 缓存未命中，从CSV加载
+        city_folder = self.results_dir / city_name
+        filename = city_folder / f"{city_name}-{keyword}-news.csv"
+        
+        if not filename.exists():
+            debug_log(f"CSV文件不存在，创建空URL集合: {filename}")
+            self.url_cache[cache_key] = set()
+            return self.url_cache[cache_key]
+        
+        try:
+            # 只读取url列，提高性能
+            df = pd.read_csv(filename, encoding='utf-8', usecols=['url'])
+            existing_urls = set(df['url'].dropna().tolist())
+            
+            # 存入缓存
+            self.url_cache[cache_key] = existing_urls
+            logger.info(f"从 {filename} 加载了 {len(existing_urls)} 个已存在的URL并缓存")
+            return existing_urls
+            
+        except Exception as e:
+            logger.error(f"加载已有URL失败 {filename}: {e}")
+            self.url_cache[cache_key] = set()
+            return self.url_cache[cache_key]
+
+    def add_url_to_cache(self, city_name: str, keyword: str, url: str):
+        """将新URL添加到缓存中"""
+        cache_key = (city_name, keyword)
+        if cache_key not in self.url_cache:
+            self.url_cache[cache_key] = set()
+        self.url_cache[cache_key].add(url)
+        debug_log(f"添加URL到缓存: {url}")
+
+    def clear_url_cache_for_pair(self, city_name: str, keyword: str):
+        """清理特定城市对的URL缓存"""
+        cache_key = (city_name, keyword)
+        if cache_key in self.url_cache:
+            del self.url_cache[cache_key]
+            debug_log(f"已清理URL缓存: {city_name}-{keyword}")
+
     async def run_crawler(self, cities_csv_file: str):
         """运行爬虫主程序"""
         logger.info("启动爬虫")
@@ -1007,6 +1135,9 @@ class ZJCrawler:
         if not target_cities:
             logger.error("无法加载目标城市列表")
             return
+
+        # 加载爬取进度
+        progress = self.load_progress()
 
         async with LLMApiClient(llm_api_key) as llm_client:
             self.llm_client = llm_client
@@ -1072,6 +1203,12 @@ class ZJCrawler:
                                 if target_city_name == city_name:
                                     logger.info(f"跳过自身城市: {city_name}")
                                     continue
+                                
+                                # 检查是否已完成
+                                if self.is_city_pair_completed(progress, city_name, target_city_name):
+                                    logger.info(f"跳过已完成的城市对: {city_name} -> {target_city_name}")
+                                    continue
+                                
                                 try:
                                     debug_log(f"开始任务: {city_name} -> {target_city_name}")
                                     results = await self.process_single_city_keyword(
@@ -1082,11 +1219,20 @@ class ZJCrawler:
                                         logger.info(f"{city_name}-{target_city_name} 完成，共{len(results)}条结果已保存")
                                     else:
                                         logger.info(f"{city_name}-{target_city_name} 无有效结果")
+                                    
+                                    # 标记为已完成
+                                    self.mark_city_pair_completed(progress, city_name, target_city_name)
+                                    
+                                    # 清理该城市对的URL缓存，释放内存
+                                    self.clear_url_cache_for_pair(city_name, target_city_name)
 
                                     await asyncio.sleep(3)  # 增加延时
 
                                 except Exception as e:
                                     logger.error(f"处理 {city_name}-{target_city_name} 失败: {e}")
+                                    # 不标记为完成，下次可以重试
+                                    # 清理缓存，下次重新加载
+                                    self.clear_url_cache_for_pair(city_name, target_city_name)
                                     continue
 
                         logger.info(f"完成城市: {city_name}")
