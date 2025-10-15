@@ -107,11 +107,23 @@ class CrawlProgress:
 class LLMApiClient:
     """LLM API客户端，使用OpenAI SDK调用SiliconFlow服务"""
 
+    # 可用模型列表，按优先级排序
+    AVAILABLE_MODELS = [
+        "Qwen/Qwen3-8B",
+        "deepseek-ai/DeepSeek-R1-0528-Qwen3-8B",
+        "THUDM/GLM-Z1-9B-0414",
+        "THUDM/GLM-4-9B-0414",
+        "Qwen/Qwen2.5-7B-Instruct",
+        "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
+    ]
+
     def __init__(self, api_key: str, base_url: str = "https://api.siliconflow.cn/v1"):
         self.client = AsyncOpenAI(
             api_key=api_key,
             base_url=base_url
         )
+        self.current_model_index = 0  # 当前使用的模型索引
+        self.model_usage_count = {model: 0 for model in self.AVAILABLE_MODELS}  # 记录每个模型的使用次数
 
     async def __aenter__(self):
         debug_log("LLMApiClient进入上下文管理器")
@@ -119,7 +131,23 @@ class LLMApiClient:
 
     async def __aexit__(self, exc_type, exc, tb):
         debug_log("LLMApiClient退出上下文管理器")
+        # 输出模型使用统计
+        logger.info("模型使用统计:")
+        for model, count in self.model_usage_count.items():
+            logger.info(f"  {model}: {count} 次")
         return False
+
+    def get_current_model(self) -> str:
+        """获取当前使用的模型"""
+        return self.AVAILABLE_MODELS[self.current_model_index]
+
+    def switch_to_next_model(self) -> str:
+        """切换到下一个模型"""
+        old_model = self.get_current_model()
+        self.current_model_index = (self.current_model_index + 1) % len(self.AVAILABLE_MODELS)
+        new_model = self.get_current_model()
+        logger.warning(f"模型切换: {old_model} -> {new_model}")
+        return new_model
 
     def extract_main_html_content(self, html: str) -> str:
         """
@@ -234,94 +262,159 @@ class LLMApiClient:
         debug_log(f"提供给LLM的文本块数量: {len(limited_blocks)}")
         debug_log(f"LLM提示词前200字符: {prompt[:200]}")
 
-        try:
-            response = await self.client.chat.completions.create(
-                model="Qwen/Qwen3-8B",
-                messages=[
-                    {"role": "system", "content": "You are a helpful assistant designed to output JSON."},
-                    {"role": "user", "content": prompt}
-                ],
-                max_tokens=2000,
-                temperature=0.1,
-                frequency_penalty=0.1,
-                stream=True,
-                timeout=30
-            )
+        # 最多重试次数（用于非 429 错误）
+        max_retries = 5
+        retry_count = 0
+        # 429 错误的循环轮换次数（无限制，直到成功或遇到其他错误）
+        rate_limit_cycle_count = 0
 
-            content = ""
-            async for chunk in response:
-                delta = chunk.choices[0].delta if chunk.choices else None
-                if delta and delta.content:
-                    content += delta.content
-            debug_log(f"LLM完整响应长度: {len(content)}")
-
-            if not content.strip():
-                return {
-                    "status": "error",
-                    "title_indices": [],
-                    "content_indices": [],
-                    "message": "LLM返回空内容",
-                    "error": "LLM返回空内容"
-                }
-
-            # 使用增强的JSON提取方法
-            json_str = self.extract_json_from_response(content)
+        while retry_count < max_retries:
+            current_model = self.get_current_model()
             
-            if not json_str:
-                logger.error(f"无法从LLM响应中提取JSON {url}, 原始内容: {content[:200]}")
-                return {
-                    "status": "error",
-                    "title_indices": [],
-                    "content_indices": [],
-                    "message": "无法提取JSON内容",
-                    "error": "无法提取JSON内容"
-                }
-
             try:
-                parsed = json.loads(json_str)
-                status = (parsed.get("status") or "").lower()
-                message = parsed.get("message", "")
-                debug_log(f"LLM解析状态: {status}, message: {message}")
-                return {
-                    "status": status,
-                    "title_indices": parsed.get("title_indices", []),
-                    "content_indices": parsed.get("content_indices", []),
-                    "message": message,
-                    "error": "" if status == "success" else (message or "LLM返回非成功状态")
-                }
-            except json.JSONDecodeError as e:
-                logger.error(f"JSON解析失败 {url}: {e}")
-                logger.error(f"提取的JSON字符串: {json_str[:500]}")
-                logger.error(f"原始LLM响应: {content[:500]}")
-                return {
-                    "status": "error",
-                    "title_indices": [],
-                    "content_indices": [],
-                    "message": f"JSON解析失败: {str(e)}",
-                    "error": f"JSON解析失败: {str(e)}"
-                }
+                logger.info(f"使用模型: {current_model} - URL: {url[:80]}...")
+                debug_log(f"尝试 #{retry_count + 1}, 429轮换 #{rate_limit_cycle_count}, 模型: {current_model}")
+                
+                response = await self.client.chat.completions.create(
+                    model=current_model,
+                    messages=[
+                        {"role": "system", "content": "You are a helpful assistant designed to output JSON."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    max_tokens=2000,
+                    temperature=0.1,
+                    frequency_penalty=0.1,
+                    stream=True,
+                    timeout=30
+                )
 
-        except asyncio.TimeoutError:
-            error_msg = f"LLM API调用超时: {url}"
-            logger.error(error_msg)
-            return {
-                "status": "error",
-                "title_indices": [],
-                "content_indices": [],
-                "message": "",
-                "error": error_msg
-            }
+                content = ""
+                async for chunk in response:
+                    delta = chunk.choices[0].delta if chunk.choices else None
+                    if delta and delta.content:
+                        content += delta.content
+                
+                # 记录成功使用
+                self.model_usage_count[current_model] += 1
+                logger.info(f"模型 {current_model} 成功响应 - 长度: {len(content)}")
+                debug_log(f"LLM完整响应长度: {len(content)}, 使用模型: {current_model}")
 
-        except Exception as e:
-            error_msg = f"LLM API调用失败: {str(e)}"
-            logger.error(f"{error_msg} - URL: {url}")
-            return {
-                "status": "error",
-                "title_indices": [],
-                "content_indices": [],
-                "message": "",
-                "error": error_msg
-            }
+                if not content.strip():
+                    return {
+                        "status": "error",
+                        "title_indices": [],
+                        "content_indices": [],
+                        "message": "LLM返回空内容",
+                        "error": "LLM返回空内容"
+                    }
+
+                # 使用增强的JSON提取方法
+                json_str = self.extract_json_from_response(content)
+                
+                if not json_str:
+                    logger.error(f"无法从LLM响应中提取JSON {url}, 原始内容: {content[:200]}")
+                    return {
+                        "status": "error",
+                        "title_indices": [],
+                        "content_indices": [],
+                        "message": "无法提取JSON内容",
+                        "error": "无法提取JSON内容"
+                    }
+
+                try:
+                    parsed = json.loads(json_str)
+                    status = (parsed.get("status") or "").lower()
+                    message = parsed.get("message", "")
+                    debug_log(f"LLM解析状态: {status}, message: {message}")
+                    return {
+                        "status": status,
+                        "title_indices": parsed.get("title_indices", []),
+                        "content_indices": parsed.get("content_indices", []),
+                        "message": message,
+                        "error": "" if status == "success" else (message or "LLM返回非成功状态")
+                    }
+                except json.JSONDecodeError as e:
+                    logger.error(f"JSON解析失败 {url}: {e}")
+                    logger.error(f"提取的JSON字符串: {json_str[:500]}")
+                    logger.error(f"原始LLM响应: {content[:500]}")
+                    return {
+                        "status": "error",
+                        "title_indices": [],
+                        "content_indices": [],
+                        "message": f"JSON解析失败: {str(e)}",
+                        "error": f"JSON解析失败: {str(e)}"
+                    }
+
+            except asyncio.TimeoutError:
+                error_msg = f"LLM API调用超时 (模型: {current_model})"
+                logger.error(f"{error_msg} - URL: {url}")
+                retry_count += 1
+                if retry_count < max_retries:
+                    await asyncio.sleep(2)
+                    continue
+                else:
+                    return {
+                        "status": "error",
+                        "title_indices": [],
+                        "content_indices": [],
+                        "message": "",
+                        "error": error_msg
+                    }
+
+            except Exception as e:
+                error_str = str(e)
+                
+                # 检查是否是 429 错误（速率限制）
+                if "429" in error_str or "rate_limit" in error_str.lower() or "too many requests" in error_str.lower():
+                    logger.warning(f"模型 {current_model} 遇到速率限制 (429)")
+                    
+                    # 切换到下一个模型
+                    old_model = current_model
+                    new_model = self.switch_to_next_model()
+                    
+                    # 记录轮换次数
+                    rate_limit_cycle_count += 1
+                    
+                    # 如果已经轮换了一圈所有模型
+                    if rate_limit_cycle_count > 0 and rate_limit_cycle_count % len(self.AVAILABLE_MODELS) == 0:
+                        cycle_num = rate_limit_cycle_count // len(self.AVAILABLE_MODELS)
+                        logger.warning(f"所有 {len(self.AVAILABLE_MODELS)} 个模型均遇到限制，第 {cycle_num} 轮轮换，等待后继续...")
+                        # 等待更长时间后继续尝试
+                        await asyncio.sleep(2)
+                    else:
+                        # 短暂延迟后重试
+                        await asyncio.sleep(0.5)
+                    
+                    # 429 错误不计入 retry_count，持续尝试
+                    continue
+                else:
+                    # 其他错误计入重试次数
+                    error_msg = f"LLM API调用失败 (模型: {current_model}): {error_str}"
+                    logger.error(f"{error_msg} - URL: {url}")
+                    
+                    retry_count += 1
+                    if retry_count < max_retries:
+                        await asyncio.sleep(2)
+                        continue
+                    else:
+                        return {
+                            "status": "error",
+                            "title_indices": [],
+                            "content_indices": [],
+                            "message": "",
+                            "error": error_msg
+                        }
+
+        # 达到最大重试次数（非 429 错误）
+        error_msg = f"LLM API调用失败，已重试 {max_retries} 次"
+        logger.error(f"{error_msg} - URL: {url}")
+        return {
+            "status": "error",
+            "title_indices": [],
+            "content_indices": [],
+            "message": "",
+            "error": error_msg
+        }
 
 
 class ZJCrawler:
@@ -822,260 +915,280 @@ class ZJCrawler:
             
         return result
 
-    async def process_results_individually(self, city_name: str, keyword: str, 
-                                           results: List[SearchResult], page_num: int,
-                                           existing_urls: set) -> List[SearchResult]:
-        """逐个处理搜索结果并立即保存"""
-        if not results:
-            return results
+    async def process_and_save_single_result(
+        self,
+        result: SearchResult, 
+        semaphore: asyncio.Semaphore,
+        existing_urls: set,
+        city_name: str,
+        keyword: str,
+        page_num: int
+    ) -> SearchResult:
+        """处理单个结果并立即保存（用于生产者-消费者模式）"""
+        # 检查URL是否已存在
+        if result.url in existing_urls:
+            result.error = "URL已存在，跳过处理"
+            debug_log(f"跳过已存在的URL: {result.url}")
+            return result
+        
+        # 处理结果
+        processed = await self.process_single_result(
+            result, semaphore, existing_urls, city_name, keyword
+        )
+        
+        # 立即保存（非跳过的结果）
+        if processed.error != "URL已存在，跳过处理":
+            await self.save_single_result_to_csv(city_name, keyword, processed, page_num)
+        
+        return processed
 
-        debug_log(f"开始逐个处理 {len(results)} 个搜索结果")
+    async def fetch_search_page(
+        self, 
+        city_info: Dict, 
+        keyword: str, 
+        page_num: int
+    ) -> Tuple[List[SearchResult], int]:
+        """获取指定页的搜索结果（独立方法，用于生产者）"""
+        url = self.build_search_url(city_info, keyword, page_num)
+        city_name = [name for name, info in self.zj_cities.items() if info == city_info][0] if city_info in self.zj_cities.values() else "未知城市"
         
-        # 创建信号量来限制并发数量
-        semaphore = asyncio.Semaphore(self.max_concurrent_pages)
-        processed_results = []
+        logger.info(f"正在爬取搜索页: {city_name} - {keyword} - 第{page_num}页")
+        network_logger.info(f"===== 开始爬取: {city_name} - {keyword} - 第{page_num}页 =====")
         
-        # 创建任务列表但不立即执行全部
-        tasks = []
-        for result in results:
-            task = asyncio.create_task(
-                self.process_single_result(result, semaphore, existing_urls, city_name, keyword)
-            )
-            tasks.append(task)
+        # 创建新页面用于搜索
+        page = await self.context.new_page()
+        self.setup_network_logging(page)
         
-        # 逐个等待任务完成并立即保存
-        for i, task in enumerate(tasks, 1):
-            try:
-                processed_result = await task
-                processed_results.append(processed_result)
-                
-                # 只保存非跳过的结果
-                if processed_result.error != "URL已存在，跳过处理":
-                    await self.save_single_result_to_csv(city_name, keyword, processed_result, page_num)
-                    debug_log(f"已处理并保存第{i}/{len(results)}个结果")
-                else:
-                    debug_log(f"已跳过第{i}/{len(results)}个结果（URL已存在）")
-                
-            except Exception as e:
-                logger.error(f"处理第{i}个结果时出现异常: {e}")
-                # 创建错误结果
-                error_result = results[i-1] if i <= len(results) else SearchResult("", "", "", "", "")
-                error_result.error = f"处理异常: {str(e)}"
-                processed_results.append(error_result)
-                
-                # 保存错误结果
-                await self.save_single_result_to_csv(city_name, keyword, error_result, page_num)
+        results = []
+        total_pages = 0
+        retry_count = 0
+        max_retries = 10
+        
+        try:
+            while retry_count < max_retries:
+                try:
+                    debug_log(f"尝试访问搜索页 (第{retry_count + 1}次): {url}")
+                    
+                    await page.set_extra_http_headers({
+                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+                        "Accept-Encoding": "gzip, deflate, br",
+                        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+                        "Cache-Control": "max-age=0",
+                        "Connection": "keep-alive",
+                        "DNT": "1",
+                        "Sec-Fetch-Dest": "document",
+                        "Sec-Fetch-Mode": "navigate",
+                        "Sec-Fetch-Site": "none",
+                        "Sec-Fetch-User": "?1",
+                        "Upgrade-Insecure-Requests": "1",
+                        "sec-ch-ua": '"Google Chrome";v="124", "Chromium";v="124", "Not-A.Brand";v="99"',
+                        "sec-ch-ua-mobile": "?0",
+                        "sec-ch-ua-platform": '"Windows"'
+                    })
+                    
+                    await page.goto(url, wait_until='networkidle', timeout=30000)
+                    await page.wait_for_timeout(3000)
+                    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                    await page.wait_for_timeout(1000)
+                    await page.evaluate("window.scrollTo(0, 0)")
+                    await page.wait_for_timeout(1000)
 
-        success_count = len([r for r in processed_results if not r.error])
-        skip_count = len([r for r in processed_results if r.error == "URL已存在，跳过处理"])
-        error_count = len(processed_results) - success_count - skip_count
-        logger.info(f"逐个处理完成: 成功{success_count}个, 跳过{skip_count}个, 失败{error_count}个")
-        
-        return processed_results
+                    results, total_pages = await self.extract_search_results(page)
+                    
+                    if not results and retry_count < max_retries - 1:
+                        debug_log(f"第{retry_count + 1}次尝试无结果，{2}秒后重试")
+                        await asyncio.sleep(2)
+                        retry_count += 1
+                        continue
+                    else:
+                        break
+
+                except Exception as e:
+                    retry_count += 1
+                    error_msg = f"访问搜索页失败 (第{retry_count}次): {str(e)}"
+                    logger.warning(error_msg)
+                    
+                    if retry_count >= max_retries:
+                        logger.error(f"重试{max_retries}次后仍然失败: {url}")
+                        break
+                    else:
+                        await asyncio.sleep(3)
+            
+            # 设置关键词
+            for result in results:
+                result.keyword = keyword
+            
+            logger.info(f"搜索页第{page_num}页获取完成: {len(results)}条结果")
+            return results, total_pages
+            
+        finally:
+            await page.close()
 
     async def process_single_city_keyword(self, city_name: str, city_info: Dict,
                                           keyword: str, session: aiohttp.ClientSession) -> List[SearchResult]:
-        """处理单个城市的单个关键词搜索"""
+        """处理单个城市的单个关键词搜索 - 并行爬取版本"""
         all_results = []
-        page_num = 1
-        max_pages = None
-
+        
         # 加载已存在的URL（只加载一次，后续使用缓存）
         existing_urls = self.load_existing_urls(city_name, keyword)
-
         debug_log(f"开始处理城市 {city_name} 的关键词 {keyword}，已有URL数量: {len(existing_urls)}")
-        search_page = await self.context.new_page()
+
+        # 结果队列：存储待处理的搜索结果
+        # 格式: (page_num, SearchResult)
+        results_queue: asyncio.Queue = asyncio.Queue()
         
-        # 为搜索页面设置网络日志
-        self.setup_network_logging(search_page)
+        # 搜索页爬取状态
+        search_state = {
+            'current_page': 1,
+            'max_pages': None,
+            'search_finished': False,
+        }
 
-        # 预加载任务：存储下一页的搜索结果
-        next_page_task = None
-
-        try:
-            while True:
-                url = self.build_search_url(city_info, keyword, page_num)
-                logger.info(f"正在爬取: {city_name} - {keyword} - 第{page_num}页")
-                network_logger.info(f"===== 开始爬取: {city_name} - {keyword} - 第{page_num}页 =====")
-
-                results = []
-                total_pages = 0  # 添加初始化
-                retry_count = 0
-                max_retries = 3
-                
-                # 如果有预加载的下一页任务，等待它完成
-                if next_page_task:
+        async def search_page_producer():
+            """生产者：持续爬取搜索页并将结果放入队列"""
+            try:
+                while not search_state['search_finished']:
+                    current_page = search_state['current_page']
+                    
+                    # 检查是否已到达最大页数
+                    if search_state['max_pages'] and current_page > search_state['max_pages']:
+                        logger.info(f"已达到最大页数 {search_state['max_pages']}，停止爬取搜索页")
+                        search_state['search_finished'] = True
+                        break
+                    
+                    # 检查队列中剩余结果数
+                    # 如果队列中结果数 >= max_concurrent_pages，暂停爬取
+                    queue_size = results_queue.qsize()
+                    if queue_size >= self.max_concurrent_pages:
+                        logger.info(f"队列中有 {queue_size} 个结果待处理，暂停搜索页爬取")
+                        await asyncio.sleep(2)
+                        continue
+                    
+                    # 爬取当前页
                     try:
-                        results, total_pages = await next_page_task
-                        logger.info(f"使用预加载的第{page_num}页结果，共{len(results)}条")
-                        next_page_task = None  # 重置任务标记
-                    except Exception as e:
-                        logger.error(f"预加载任务失败: {e}，重新获取")
-                        next_page_task = None
-                
-                # 如果没有预加载结果，正常获取
-                if not results:
-                    # 获取搜索结果页面（保持原有逻辑）
-                    while retry_count < max_retries:
-                        try:
-                            debug_log(f"尝试访问页面 (第{retry_count + 1}次): {url}")
-                            
-                            # 设置额外的请求头
-                            await search_page.set_extra_http_headers({
-                                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
-                                "Accept-Encoding": "gzip, deflate, br",
-                                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-                                "Cache-Control": "max-age=0",
-                                "Connection": "keep-alive",
-                                "DNT": "1",
-                                "Sec-Fetch-Dest": "document",
-                                "Sec-Fetch-Mode": "navigate",
-                                "Sec-Fetch-Site": "none",
-                                "Sec-Fetch-User": "?1",
-                                "Upgrade-Insecure-Requests": "1",
-                                "sec-ch-ua": '"Google Chrome";v="124", "Chromium";v="124", "Not-A.Brand";v="99"',
-                                "sec-ch-ua-mobile": "?0",
-                                "sec-ch-ua-platform": '"Windows"'
-                            })
-                            
-                            await search_page.goto(url, wait_until='networkidle', timeout=30000)
-                            debug_log(f"页面加载完成，当前URL: {search_page.url}")
-                            
-                            # 额外等待确保页面完全渲染
-                            await search_page.wait_for_timeout(3000)
-                            
-                            # 检查页面是否正常加载
-                            page_title = await search_page.title()
-                            debug_log(f"页面标题: {page_title}")
-                            
-                            # 尝试滚动页面以触发懒加载
-                            await search_page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                            await search_page.wait_for_timeout(1000)
-                            await search_page.evaluate("window.scrollTo(0, 0)")
-                            await search_page.wait_for_timeout(1000)
-
-                            results, total_pages = await self.extract_search_results(search_page)
-                            
-                            if not results and retry_count < max_retries - 1:
-                                debug_log(f"第{retry_count + 1}次尝试无结果，{2}秒后重试")
-                                await asyncio.sleep(2)
-                                retry_count += 1
-                                continue
-                            else:
-                                break
-
-                        except Exception as e:
-                            retry_count += 1
-                            error_msg = f"访问页面失败 (第{retry_count}次): {str(e)}"
-                            logger.warning(error_msg)
-                            
-                            if retry_count >= max_retries:
-                                logger.error(f"重试{max_retries}次后仍然失败: {url}")
-                                break
-                            else:
-                                await asyncio.sleep(3)
-
-                if not results:
-                    logger.warning(f"第{page_num}页无搜索结果，结束该关键词搜索")
-                    break
-
-                # 设置关键词
-                for result in results:
-                    result.keyword = keyword
-
-                # **立即开始预加载下一页（如果还有下一页）**
-                if max_pages is None and total_pages > 0:
-                    max_pages = total_pages
-                    logger.info(f"{city_name} - {keyword}: 共{max_pages}页")
-                
-                # 判断是否需要预加载下一页
-                should_preload = (max_pages is None or page_num < max_pages)
-                if should_preload:
-                    next_page_num = page_num + 1
-                    next_url = self.build_search_url(city_info, keyword, next_page_num)
-                    
-                    # 定义预加载函数（使用闭包捕获变量）
-                    async def create_preload_task():
-                        preload_page = await self.context.new_page()
-                        self.setup_network_logging(preload_page)
+                        results, total_pages = await self.fetch_search_page(
+                            city_info, keyword, current_page
+                        )
                         
-                        try:
-                            logger.info(f"开始预加载第{next_page_num}页")
-                            
-                            await preload_page.set_extra_http_headers({
-                                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
-                                "Accept-Encoding": "gzip, deflate, br",
-                                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-                                "Cache-Control": "max-age=0",
-                                "Connection": "keep-alive",
-                                "DNT": "1",
-                                "Sec-Fetch-Dest": "document",
-                                "Sec-Fetch-Mode": "navigate",
-                                "Sec-Fetch-Site": "none",
-                                "Sec-Fetch-User": "?1",
-                                "Upgrade-Insecure-Requests": "1",
-                                "sec-ch-ua": '"Google Chrome";v="124", "Chromium";v="124", "Not-A.Brand";v="99"',
-                                "sec-ch-ua-mobile": "?0",
-                                "sec-ch-ua-platform": '"Windows"'
-                            })
-                            
-                            await preload_page.goto(next_url, wait_until='networkidle', timeout=30000)
-                            await preload_page.wait_for_timeout(3000)
-                            await preload_page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                            await preload_page.wait_for_timeout(1000)
-                            await preload_page.evaluate("window.scrollTo(0, 0)")
-                            await preload_page.wait_for_timeout(1000)
-                            
-                            next_results, next_total = await self.extract_search_results(preload_page)
-                            logger.info(f"预加载第{next_page_num}页完成，获取{len(next_results)}条结果")
-                            
-                            # 关闭当前搜索页，替换为预加载页
-                            nonlocal search_page
-                            await search_page.close()
-                            search_page = preload_page
-                            
-                            return next_results, next_total
-                        except Exception as e:
-                            logger.error(f"预加载第{next_page_num}页失败: {e}")
-                            await preload_page.close()
-                            raise
-                    
-                    # 创建预加载任务
-                    next_page_task = asyncio.create_task(create_preload_task())
-
-                # **逐个处理当前页搜索结果内容提取并立即保存**
-                logger.info(f"开始逐个处理第{page_num}页的{len(results)}个搜索结果")
-                processed_results = await self.process_results_individually(
-                    city_name, keyword, results, page_num, existing_urls
-                )
+                        # 更新最大页数
+                        if search_state['max_pages'] is None and total_pages > 0:
+                            search_state['max_pages'] = total_pages
+                            logger.info(f"{city_name} - {keyword}: 共{total_pages}页")
+                        
+                        # 如果没有结果，停止搜索
+                        if not results:
+                            logger.warning(f"第{current_page}页无搜索结果，停止搜索")
+                            search_state['search_finished'] = True
+                            break
+                        
+                        # 将结果放入队列
+                        for result in results:
+                            await results_queue.put((current_page, result))
+                        
+                        logger.info(f"已将第{current_page}页的 {len(results)} 个结果加入队列，队列大小: {results_queue.qsize()}")
+                        
+                        # 移动到下一页
+                        search_state['current_page'] += 1
+                        
+                        # 短暂延迟
+                        await asyncio.sleep(1)
+                        
+                    except Exception as e:
+                        logger.error(f"爬取搜索页第{current_page}页失败: {e}")
+                        search_state['search_finished'] = True
+                        break
                 
-                all_results.extend(processed_results)
-                debug_log(f"第{page_num}页已处理完成，累计结果数量: {len(all_results)}")
+                logger.info("搜索页生产者任务完成")
+                
+            finally:
+                # 发送完成信号（放入 None）
+                await results_queue.put((None, None))
 
-                if max_pages and page_num >= max_pages:
-                    debug_log("达到最大页数，结束分页")
-                    # 取消未完成的预加载任务
-                    if next_page_task and not next_page_task.done():
-                        next_page_task.cancel()
-                        try:
-                            await next_page_task
-                        except asyncio.CancelledError:
-                            pass
-                    break
-
-                page_num += 1
-                await asyncio.sleep(1)
-
-        finally:
-            # 清理预加载任务
-            if next_page_task and not next_page_task.done():
-                next_page_task.cancel()
-                try:
-                    await next_page_task
-                except asyncio.CancelledError:
-                    pass
+        async def result_consumer():
+            """消费者：从队列中取出结果并处理"""
+            # 创建信号量限制并发
+            semaphore = asyncio.Semaphore(self.max_concurrent_pages)
+            active_tasks = []
             
-            await search_page.close()
+            try:
+                while True:
+                    # 从队列获取结果
+                    page_num, result = await results_queue.get()
+                    
+                    # 收到完成信号
+                    if page_num is None and result is None:
+                        logger.info("收到搜索完成信号，等待剩余任务完成...")
+                        # 等待所有活跃任务完成
+                        if active_tasks:
+                            completed_results = await asyncio.gather(*active_tasks, return_exceptions=True)
+                            # 收集结果
+                            for res in completed_results:
+                                if isinstance(res, SearchResult):
+                                    all_results.append(res)
+                                elif isinstance(res, Exception):
+                                    logger.error(f"处理结果任务异常: {res}")
+                        break
+                    
+                    # 创建处理任务
+                    task = asyncio.create_task(
+                        self.process_and_save_single_result(
+                            result, semaphore, existing_urls, 
+                            city_name, keyword, page_num
+                        )
+                    )
+                    active_tasks.append(task)
+                    
+                    # 清理已完成的任务并收集结果
+                    done_tasks = [t for t in active_tasks if t.done()]
+                    for task in done_tasks:
+                        try:
+                            processed_result = await task
+                            all_results.append(processed_result)
+                        except Exception as e:
+                            logger.error(f"处理结果任务异常: {e}")
+                    
+                    # 保留未完成的任务
+                    active_tasks = [t for t in active_tasks if not t.done()]
+                    
+                    # 如果活跃任务达到上限，等待至少一个完成
+                    if len(active_tasks) >= self.max_concurrent_pages:
+                        done, pending = await asyncio.wait(
+                            active_tasks, 
+                            return_when=asyncio.FIRST_COMPLETED
+                        )
+                        
+                        # 收集已完成任务的结果
+                        for task in done:
+                            try:
+                                processed_result = await task
+                                all_results.append(processed_result)
+                            except Exception as e:
+                                logger.error(f"处理结果任务异常: {e}")
+                        
+                        active_tasks = list(pending)
+                    
+                    # 标记队列任务完成
+                    results_queue.task_done()
+                
+                logger.info("结果消费者任务完成")
+                
+            except Exception as e:
+                logger.error(f"消费者任务异常: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
+
+        # 启动生产者和消费者
+        producer_task = asyncio.create_task(search_page_producer())
+        consumer_task = asyncio.create_task(result_consumer())
+        
+        try:
+            # 等待两个任务完成
+            await asyncio.gather(producer_task, consumer_task)
+            
+        except Exception as e:
+            logger.error(f"并行爬取任务异常: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
 
         logger.info(f"完成 {city_name} - {keyword}: 总共{len(all_results)}条结果，已逐个保存")
         network_logger.info(f"===== 完成 {city_name} - {keyword}: 总共{len(all_results)}条结果 =====")
@@ -1397,7 +1510,7 @@ async def main():
     cities_csv_file = "target_cities.csv"
 
     # 不再需要手动提供API key，直接从文件读取
-    crawler = ZJCrawler("", max_concurrent_pages=5)  # API key会从文件自动加载
+    crawler = ZJCrawler("", max_concurrent_pages=30)  # API key会从文件自动加载
     await crawler.run_crawler(cities_csv_file)
 
 
