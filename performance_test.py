@@ -117,7 +117,7 @@ AI 应用潜力：
 ]
 
 class PerformanceTester:
-    def __init__(self, model: str = "/models/qwen3-8b"):
+    def __init__(self, model: str = "models/qwen3-14b-awq"):
         self.model = model
         self.results = []
         self.start_time = None
@@ -139,7 +139,7 @@ class PerformanceTester:
                 ],
                 temperature=0.1,
                 frequency_penalty=0.2,
-                max_tokens=1000,
+                max_tokens=256,
                 timeout=300  # 5分钟超时
             )
             
@@ -269,9 +269,9 @@ async def main():
     print("vLLM 并发性能测试")
     print("=" * 80)
     print(f"测试参数设置:")
-    print(f"  - 模型: /models/qwen3-8b")
+    print(f"  - 模型: models/qwen3-14b-awq")
     print(f"  - 输入长度: ~1000 tokens")
-    print(f"  - 输出长度: 1000 tokens (max_tokens)")
+    print(f"  - 输出长度: 256 tokens (max_tokens)")
     print(f"  - Temperature: 0.1")
     print(f"  - Frequency Penalty: 0.2")
     print(f"  - 测试时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -280,15 +280,15 @@ async def main():
     tester = PerformanceTester()
     
     # 测试不同的并发数
-    concurrency_levels = [1, 2, 4, 8, 16, 32]
-    requests_per_level = 10  # 每个并发级别测试 10 个请求
+    concurrency_levels = [1, 2, 4, 8, 16, 32, 64, 128, 256]
+    requests_per_level = 4  # 每个并发级别测试 10 个请求
     
     all_stats = []
     
     for concurrency in concurrency_levels:
         stats = await tester.run_concurrent_test(
             concurrency=concurrency,
-            total_requests=requests_per_level
+            total_requests=requests_per_level * concurrency
         )
         
         if stats:
@@ -328,9 +328,9 @@ async def main():
         report = {
             "timestamp": datetime.now().isoformat(),
             "test_parameters": {
-                "model": "/models/qwen3-8b",
+                "model": "models/qwen3-14b-awq",
                 "input_tokens": "~1000",
-                "output_tokens": "1000",
+                "output_tokens": "256",
                 "temperature": 0.1,
                 "frequency_penalty": 0.2
             },

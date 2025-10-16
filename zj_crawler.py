@@ -394,7 +394,7 @@ class LLMApiClient:
 
 输出格式要求：
 仅返回一个合法的 JSON 对象，格式如下：
-{{"status":"success", "title_indices":编号, "content_indices":编号, "message":""}}
+{{"status":"success", "title_indices":编号, "content_indices":编号, "message":"错误原因"}}
 请不要输出额外说明、解释或注释。
 
 待分析的文本片段：
@@ -431,7 +431,8 @@ class LLMApiClient:
                     temperature=0.2,
                     frequency_penalty=0.15,
                     stream=True,
-                    timeout=30
+                    timeout=30,
+                    extra_body={"chat_template_kwargs": {"enable_thinking": False}} if USE_LOCAL_VLLM else {"enable_thinking": False}
                 )
 
                 content = ""
