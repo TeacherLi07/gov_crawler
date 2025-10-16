@@ -313,6 +313,10 @@ class SearchResultFetcher:
 class LLMApiClient:
     """LLM API客户端，使用OpenAI SDK调用SiliconFlow服务"""
 
+    # 添加类级别的变量和锁
+    last_call_time = 0
+    call_lock = asyncio.Lock()
+
     # 可用模型列表，按优先级排序
     AVAILABLE_MODELS = ["models/qwen3-14b-awq"] if USE_LOCAL_VLLM else [
         "Qwen/Qwen3-8B",
@@ -398,6 +402,13 @@ class LLMApiClient:
 
     async def select_text_blocks(self, blocks: List[Tuple[int, str]], url: str) -> Dict[str, Any]:
         """选择文本块"""
+        # 使用类级别的锁控制调用间隔
+        async with self.__class__.call_lock:
+            current_time = time.time()
+            time_since_last_call = current_time - self.__class__.last_call_time
+            if time_since_last_call < 0.2:  # 0.2秒间隔
+                await asyncio.sleep(0.2 - time_since_last_call)
+            self.__class__.last_call_time = time.time()
         prompt = f"""请分析以下网页文本片段，找出其中的**正文**。
 
 输出要求：
@@ -440,7 +451,7 @@ class LLMApiClient:
                     temperature=0.2,
                     frequency_penalty=0.15,
                     stream=True,
-                    timeout=30,
+                    timeout=300,
                     extra_body={"chat_template_kwargs": {"enable_thinking": False}} if USE_LOCAL_VLLM else {"enable_thinking": False}
                 )
 
@@ -1085,6 +1096,9 @@ class CrawlerOrchestrator:
     
     async def add_city_keyword_task(self, city_name: str, city_info: Dict, keyword: str):
         """添加单个城市关键词任务（非阻塞）"""
+        while self.search_queue.qsize() >= 3:  # 设置队列上限为3
+            await asyncio.sleep(60)  # 等待队列有空位
+            
         initial_task = SearchTask(
             city_name=city_name,
             city_info=city_info,
