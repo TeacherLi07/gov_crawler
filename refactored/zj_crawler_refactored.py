@@ -96,7 +96,7 @@ class SearchResult:
     column: str = ""
     error: str = ""
     page_num: int = 1
-    search_page_title: str = ""  # 新增：从搜索页获取的标题
+    search_page_title: str = ""  
 
 
 @dataclass
@@ -168,7 +168,6 @@ class SearchResultFetcher:
         total_pages = 0
 
         try:
-            # await page.wait_for_timeout(2000)
             await page.wait_for_selector('.comprehensive', timeout=15000)
 
             try:
@@ -281,7 +280,6 @@ class SearchResultFetcher:
                     })
                     
                     await page.goto(url, wait_until='networkidle', timeout=30000)
-                    # await page.wait_for_timeout(3000)
 
                     results, total_pages = await self.extract_search_results(page)
                     
@@ -601,13 +599,11 @@ class ContentExtractor:
             try:
                 if 'visit/link.do' in url:
                     await page.goto(url, wait_until='domcontentloaded', timeout=30000)
-                    # await page.wait_for_timeout(5000)
 
                 actual_url = page.url
                 if actual_url != url:
                     await page.goto(actual_url, wait_until='domcontentloaded', timeout=30000)
 
-                # await page.wait_for_timeout(5000)
                 html = await page.content()
 
                 if len(html) < 200:
@@ -869,7 +865,7 @@ class ResultSaver:
 
 
 class CrawlerOrchestrator:
-    """爬虫编排器 - 协调各个组件"""
+    """爬虫编排器 - 协调各个组件，支持连续任务流"""
     
     def __init__(
         self,
@@ -903,6 +899,11 @@ class CrawlerOrchestrator:
         
         # URL缓存
         self.url_cache: Dict[Tuple[str, str], Set[str]] = {}
+        self.url_cache_lock = asyncio.Lock()
+        
+        # 工作器任务列表
+        self.workers = []
+        self.workers_started = False
     
     def load_existing_urls(self, city_name: str, keyword: str) -> Set[str]:
         """加载已存在的URL"""
@@ -950,7 +951,7 @@ class CrawlerOrchestrator:
                         )
                         await self.content_queue.put(content_task)
                     
-                    # 返回总页数用于生成后续任务
+                    # 如果是第一页且有多页，添加后续页面任务
                     if task.page_num == 1 and total_pages > 1:
                         for page_num in range(2, total_pages + 1):
                             new_task = SearchTask(
@@ -1040,47 +1041,50 @@ class CrawlerOrchestrator:
                     
                     # 更新URL缓存
                     if not task.result.error:
-                        cache_key = (task.city_name, task.keyword)
-                        if cache_key not in self.url_cache:
-                            self.url_cache[cache_key] = set()
-                        self.url_cache[cache_key].add(task.result.url)
+                        async with self.url_cache_lock:
+                            cache_key = (task.city_name, task.keyword)
+                            if cache_key not in self.url_cache:
+                                self.url_cache[cache_key] = set()
+                            self.url_cache[cache_key].add(task.result.url)
                     
                 except Exception as e:
                     logger.error(f"保存任务失败: {e}")
                 finally:
                     self.save_queue.task_done()
     
-    async def process_city_keyword(
-        self, 
-        city_name: str, 
-        city_info: Dict, 
-        keyword: str,
+    async def start_workers(
+        self,
         num_search_workers: int = 5,
         num_content_workers: int = 128,
         num_analysis_workers: int = 128,
         num_save_workers: int = 30
     ):
-        """处理单个城市关键词"""
-        # 启动工作器
-        workers = []
+        """启动所有工作器（只调用一次）"""
+        if self.workers_started:
+            return
+        
+        self.workers_started = True
         
         # 搜索工作器
         for _ in range(num_search_workers):
-            workers.append(asyncio.create_task(self.search_worker()))
+            self.workers.append(asyncio.create_task(self.search_worker()))
         
         # 内容提取工作器
         for _ in range(num_content_workers):
-            workers.append(asyncio.create_task(self.content_worker()))
+            self.workers.append(asyncio.create_task(self.content_worker()))
         
         # LLM分析工作器
         for _ in range(num_analysis_workers):
-            workers.append(asyncio.create_task(self.analysis_worker()))
+            self.workers.append(asyncio.create_task(self.analysis_worker()))
         
         # 保存工作器
         for _ in range(num_save_workers):
-            workers.append(asyncio.create_task(self.save_worker()))
+            self.workers.append(asyncio.create_task(self.save_worker()))
         
-        # 提交第一页搜索任务
+        logger.info(f"已启动所有工作器: 搜索{num_search_workers}, 内容{num_content_workers}, 分析{num_analysis_workers}, 保存{num_save_workers}")
+    
+    async def add_city_keyword_task(self, city_name: str, city_info: Dict, keyword: str):
+        """添加单个城市关键词任务（非阻塞）"""
         initial_task = SearchTask(
             city_name=city_name,
             city_info=city_info,
@@ -1088,43 +1092,49 @@ class CrawlerOrchestrator:
             page_num=1
         )
         await self.search_queue.put(initial_task)
-        
-        # 等待所有搜索任务完成
+        logger.info(f"已添加任务: {city_name} - {keyword}")
+    
+    async def wait_all_complete(self):
+        """等待所有任务完成"""
+        logger.info("等待所有搜索任务完成...")
         await self.search_queue.join()
         
         # 发送搜索结束信号
-        for _ in range(num_search_workers):
-            await self.search_queue.put(None)
+        for worker in self.workers:
+            if not worker.done() and 'search_worker' in str(worker):
+                await self.search_queue.put(None)
         
-        # 等待所有内容提取任务完成
+        logger.info("等待所有内容提取任务完成...")
         await self.content_queue.join()
         
         # 发送内容提取结束信号
-        for _ in range(num_content_workers):
-            await self.content_queue.put(None)
+        for worker in self.workers:
+            if not worker.done() and 'content_worker' in str(worker):
+                await self.content_queue.put(None)
         
-        # 等待所有分析任务完成
+        logger.info("等待所有分析任务完成...")
         await self.analysis_queue.join()
         
         # 发送分析结束信号
-        for _ in range(num_analysis_workers):
-            await self.analysis_queue.put(None)
+        for worker in self.workers:
+            if not worker.done() and 'analysis_worker' in str(worker):
+                await self.analysis_queue.put(None)
         
-        # 等待所有保存任务完成
+        logger.info("等待所有保存任务完成...")
         await self.save_queue.join()
         
         # 发送保存结束信号
-        for _ in range(num_save_workers):
-            await self.save_queue.put(None)
+        for worker in self.workers:
+            if not worker.done() and 'save_worker' in str(worker):
+                await self.save_queue.put(None)
         
         # 等待所有工作器结束
-        await asyncio.gather(*workers)
-        
-        logger.info(f"完成 {city_name} - {keyword}")
+        await asyncio.gather(*self.workers, return_exceptions=True)
+        logger.info("所有任务已完成")
 
 
 class ZJCrawler:
-    """浙江省政府网站爬虫 - 重构版"""
+    """浙江省政府网站爬虫 - 连续爬取版本"""
 
     def __init__(self, llm_api_key: str = ""):
         disable_system_proxies()
@@ -1232,12 +1242,14 @@ class ZJCrawler:
             progress[source_city] = {}
         progress[source_city][target_city] = True
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        logger.info(f"标记完成: {source_city} -> {target_city} (时间: {timestamp})")
+        logger.info(f"✓ 完成: {source_city} -> {target_city} (时间: {timestamp})")
         self.save_progress(progress)
 
     async def run_crawler(self, cities_csv_file: str):
-        """运行爬虫主程序"""
-        logger.info("启动爬虫")
+        """运行爬虫主程序 - 连续爬取版本"""
+        logger.info("=" * 80)
+        logger.info("启动连续爬取爬虫")
+        logger.info("=" * 80)
         
         try:
             llm_api_key = self.load_llm_api_key()
@@ -1273,16 +1285,14 @@ class ZJCrawler:
                         '--disable-ipc-flooding-protection',
                         '--disable-web-security',
                         '--disable-features=VizDisplayCompositor',
-                        # 启用缓存相关参数
                         f'--disk-cache-dir={self.cache_dir}',
-                        '--disk-cache-size=209715200',  # 200MB 缓存
-                        # 性能优化参数
-                        '--disable-software-rasterizer',  # 禁用软件光栅化
-                        '--disable-extensions',  # 禁用扩展
-                        '--disable-plugins',  # 禁用插件
-                        '--disable-images',  # 禁用图片加载（爬取文本不需要图片）
-                        '--blink-settings=imagesEnabled=false',  # 确保图片禁用
-                        '--disable-javascript-harmony-shipping',  # 禁用实验性JS特性
+                        '--disk-cache-size=209715200',
+                        '--disable-software-rasterizer',
+                        '--disable-extensions',
+                        '--disable-plugins',
+                        '--disable-images',
+                        '--blink-settings=imagesEnabled=false',
+                        '--disable-javascript-harmony-shipping',
                     ],
                     proxy=None
                 )
@@ -1299,14 +1309,27 @@ class ZJCrawler:
                     llm_client=llm_client,
                     results_dir=self.results_dir,
                     max_concurrent_search=3,
-                    max_concurrent_content=10,
-                    max_concurrent_analysis=5,
-                    max_concurrent_save=10
+                    max_concurrent_content=128,
+                    max_concurrent_analysis=128,
+                    max_concurrent_save=30
                 )
 
                 try:
+                    # 一次性启动所有工作器
+                    await orchestrator.start_workers(
+                        num_search_workers=3,
+                        num_content_workers=128,
+                        num_analysis_workers=128,
+                        num_save_workers=30
+                    )
+                    
+                    # 统计信息
+                    total_tasks = 0
+                    skipped_tasks = 0
+                    
+                    # 连续添加所有城市对任务
                     for city_name, city_info in self.zj_cities.items():
-                        logger.info(f"开始处理城市: {city_name}")
+                        logger.info(f"准备添加城市任务: {city_name}")
 
                         for target_city in target_cities:
                             target_city_name = str(target_city).strip()
@@ -1314,20 +1337,76 @@ class ZJCrawler:
                                 continue
                             
                             if self.is_city_pair_completed(progress, city_name, target_city_name):
-                                logger.info(f"跳过已完成的城市对: {city_name} -> {target_city_name}")
+                                skipped_tasks += 1
+                                if skipped_tasks % 100 == 0:
+                                    logger.info(f"已跳过 {skipped_tasks} 个已完成任务")
                                 continue
                             
-                            try:
-                                await orchestrator.process_city_keyword(
-                                    city_name, city_info, target_city_name
-                                )
+                            # 非阻塞地添加任务
+                            await orchestrator.add_city_keyword_task(
+                                city_name, city_info, target_city_name
+                            )
+                            total_tasks += 1
+                            
+                            # 每添加10个任务稍微延迟，避免队列瞬间爆满
+                            if total_tasks % 10 == 0:
+                                await asyncio.sleep(0.1)
+                    
+                    logger.info("=" * 80)
+                    logger.info(f"所有任务已提交: 总计 {total_tasks} 个新任务, 跳过 {skipped_tasks} 个已完成任务")
+                    logger.info("=" * 80)
+                    
+                    # 创建一个后台任务来监控队列状态
+                    async def monitor_progress():
+                        """监控爬取进度"""
+                        last_report_time = time.time()
+                        report_interval = 60  # 每60秒报告一次
+                        
+                        while True:
+                            await asyncio.sleep(10)
+                            
+                            current_time = time.time()
+                            if current_time - last_report_time >= report_interval:
+                                search_size = orchestrator.search_queue.qsize()
+                                content_size = orchestrator.content_queue.qsize()
+                                analysis_size = orchestrator.analysis_queue.qsize()
+                                save_size = orchestrator.save_queue.qsize()
                                 
+                                logger.info("=" * 80)
+                                logger.info(f"队列状态: 搜索={search_size}, 内容={content_size}, 分析={analysis_size}, 保存={save_size}")
+                                logger.info("=" * 80)
+                                
+                                last_report_time = current_time
+                                
+                                # 如果所有队列都为空，可能已经完成
+                                if search_size == 0 and content_size == 0 and analysis_size == 0 and save_size == 0:
+                                    logger.info("所有队列已清空，任务可能即将完成")
+                                    break
+                    
+                    # 启动监控任务
+                    monitor_task = asyncio.create_task(monitor_progress())
+                    
+                    # 等待所有任务完成
+                    await orchestrator.wait_all_complete()
+                    
+                    # 取消监控任务
+                    monitor_task.cancel()
+                    try:
+                        await monitor_task
+                    except asyncio.CancelledError:
+                        pass
+                    
+                    # 标记所有已处理的城市对为完成
+                    logger.info("更新进度记录...")
+                    for city_name in self.zj_cities.keys():
+                        for target_city in target_cities:
+                            target_city_name = str(target_city).strip()
+                            if target_city_name and target_city_name != city_name:
                                 self.mark_city_pair_completed(progress, city_name, target_city_name)
-                                await asyncio.sleep(3)
-
-                            except Exception as e:
-                                logger.error(f"处理 {city_name}-{target_city_name} 失败: {e}")
-                                continue
+                    
+                    logger.info("=" * 80)
+                    logger.info("所有爬取任务已完成！")
+                    logger.info("=" * 80)
 
                 finally:
                     if self.context:
