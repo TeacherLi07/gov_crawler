@@ -1055,10 +1055,10 @@ class CrawlerOrchestrator:
         city_name: str, 
         city_info: Dict, 
         keyword: str,
-        num_search_workers: int = 2,
-        num_content_workers: int = 5,
-        num_analysis_workers: int = 3,
-        num_save_workers: int = 5
+        num_search_workers: int = 5,
+        num_content_workers: int = 128,
+        num_analysis_workers: int = 128,
+        num_save_workers: int = 30
     ):
         """处理单个城市关键词"""
         # 启动工作器
@@ -1262,11 +1262,27 @@ class ZJCrawler:
                         '--no-sandbox',
                         '--disable-setuid-sandbox',
                         '--disable-dev-shm-usage',
+                        '--disable-accelerated-2d-canvas',
+                        '--no-first-run',
+                        '--no-zygote',
                         '--disable-gpu',
+                        '--disable-background-timer-throttling',
+                        '--disable-backgrounding-occluded-windows',
+                        '--disable-renderer-backgrounding',
+                        '--disable-features=TranslateUI',
+                        '--disable-ipc-flooding-protection',
+                        '--disable-web-security',
+                        '--disable-features=VizDisplayCompositor',
+                        # 启用缓存相关参数
                         f'--disk-cache-dir={self.cache_dir}',
-                        '--disk-cache-size=209715200',
-                        '--disable-images',
-                        '--blink-settings=imagesEnabled=false',
+                        '--disk-cache-size=209715200',  # 200MB 缓存
+                        # 性能优化参数
+                        '--disable-software-rasterizer',  # 禁用软件光栅化
+                        '--disable-extensions',  # 禁用扩展
+                        '--disable-plugins',  # 禁用插件
+                        '--disable-images',  # 禁用图片加载（爬取文本不需要图片）
+                        '--blink-settings=imagesEnabled=false',  # 确保图片禁用
+                        '--disable-javascript-harmony-shipping',  # 禁用实验性JS特性
                     ],
                     proxy=None
                 )
