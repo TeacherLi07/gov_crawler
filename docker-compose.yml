@@ -1,0 +1,51 @@
+services:
+  vllm:
+    # 使用指定的镜像
+    image: nalanzeyu/vllm-gfx906
+    
+    # 容器名称
+    container_name: vllm-server
+    
+    # 交互式终端和伪终端 (对应 -it)
+    stdin_open: true
+    tty: true
+
+    environment:
+      - VLLM_GPU_MEMORY_UTILIZATION=0.95
+      - VLLM_MAX_NUM_SEQS=256
+      - VLLM_MAX_NUM_BATCHED_TOKENS=8192        
+    
+    # 共享内存大小设置 (对应 --shm-size=2g)
+    # 用于 GPU 与 CPU 之间的共享内存，增加此值可提高性能
+    shm_size: 32gb
+    
+    # GPU 和设备访问配置 (对应 --device)
+    devices:
+      # AMD GPU 设备文件
+      - /dev/kfd:/dev/kfd
+      # GPU DRI 设备文件
+      - /dev/dri:/dev/dri
+    
+    # 组权限配置 (对应 --group-add video)
+    # 允许容器访问 video 组，用于 GPU 权限管理
+    group_add:
+      - video
+    
+    # 端口映射 (对应 -p 8000:8000)
+    # 格式: "宿主机端口:容器内端口"
+    # vLLM 默认监听 8000 端口
+    ports:
+      - "8000:8000"
+    
+    # 文件挂载 (对应 -v <YOUR_MODEL_PATH>:/model)
+    # 将本地模型目录挂载到容器内 /model 目录
+    volumes:
+      # 替换 /path/to/your/model 为你的实际模型路径
+      - ./models:/models
+    
+    # 启动命令 (对应 vllm serve /model)
+    command: vllm serve /models/qwen3-8b-awq
+    
+    # 重启策略
+    restart: no
+

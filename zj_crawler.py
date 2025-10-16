@@ -19,6 +19,8 @@ from openai import AsyncOpenAI
 from bs4 import BeautifulSoup
 import shutil
 
+USE_LOCAL_VLLM = True
+
 # 自定义 DNS 缓存映射
 DNS_OVERRIDE = {
     'zfwzgl.www.gov.cn': '36.112.20.164',
@@ -108,7 +110,7 @@ class LLMApiClient:
     """LLM API客户端，使用OpenAI SDK调用SiliconFlow服务"""
 
     # 可用模型列表，按优先级排序
-    AVAILABLE_MODELS = [
+    AVAILABLE_MODELS = ["/models/qwen3-8b-awq"] if USE_LOCAL_VLLM else [
         "Qwen/Qwen3-8B",
         "deepseek-ai/DeepSeek-R1-0528-Qwen3-8B",
         # "THUDM/GLM-Z1-9B-0414",
@@ -117,7 +119,7 @@ class LLMApiClient:
         "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
     ]
 
-    def __init__(self, api_key: str, base_url: str = "https://api.siliconflow.cn/v1"):
+    def __init__(self, api_key: str, base_url: str = "http://localhost:8000/v1" if USE_LOCAL_VLLM else "https://api.siliconflow.cn/"):
         self.client = AsyncOpenAI(
             api_key=api_key,
             base_url=base_url
@@ -261,6 +263,106 @@ class LLMApiClient:
         debug_log("未检测到特殊格式，尝试直接解析原内容")
         return content
 
+    def fix_json_format(self, json_str: str) -> str:
+        """尝试修复常见的JSON格式错误"""
+        if not json_str:
+            return json_str
+        
+        original_str = json_str
+        fixed = False
+        
+        # 移除可能的BOM和零宽字符
+        json_str = json_str.replace('\ufeff', '').replace('\u200b', '')
+        
+        # 修复1: 智能补全缺失的闭合括号
+        # 统计括号数量
+        open_braces = json_str.count('{')
+        close_braces = json_str.count('}')
+        open_brackets = json_str.count('[')
+        close_brackets = json_str.count(']')
+        
+        # 分析括号缺失情况
+        missing_close_brackets = open_brackets - close_brackets
+        missing_close_braces = open_braces - close_braces
+        
+        if missing_close_brackets > 0 or missing_close_braces > 0:
+            # 找到最后一个有效字符位置（去除尾部空白）
+            json_str = json_str.rstrip()
+            
+            # 策略：先补全方括号，再补全大括号
+            # 这是因为JSON对象通常是 {...}，数组字段在对象内部 {"field": [...]}
+            
+            # 补全缺失的方括号
+            if missing_close_brackets > 0:
+                # 检查最后一个字符
+                last_char = json_str[-1] if json_str else ''
+                
+                # 如果最后是逗号，先移除逗号再补全括号
+                if last_char == ',':
+                    json_str = json_str[:-1]
+                    last_char = json_str[-1] if json_str else ''
+                
+                # 添加缺失的方括号
+                json_str += ']' * missing_close_brackets
+                fixed = True
+                debug_log(f"JSON修复: 添加了 {missing_close_brackets} 个缺失的闭合方括号")
+            
+            # 补全缺失的大括号
+            if missing_close_braces > 0:
+                json_str += '}' * missing_close_braces
+                fixed = True
+                debug_log(f"JSON修复: 添加了 {missing_close_braces} 个缺失的闭合大括号")
+        
+        # 修复2: 移除末尾可能的逗号（在补全括号之前就应该处理）
+        # 这个逻辑已经在上面处理了，这里做二次检查
+        json_str = json_str.rstrip()
+        if json_str.endswith(',}'):
+            json_str = json_str[:-2] + '}'
+            fixed = True
+            debug_log("JSON修复: 移除了对象末尾的多余逗号")
+        if json_str.endswith(',]'):
+            json_str = json_str[:-2] + ']'
+            fixed = True
+            debug_log("JSON修复: 移除了数组末尾的多余逗号")
+        
+        # 修复3: 处理未闭合的字符串（简单处理）
+        # 检查引号配对
+        quote_count = json_str.count('"')
+        if quote_count % 2 != 0:
+            # 找到最后一个引号的位置
+            last_quote_pos = json_str.rfind('"')
+            # 检查最后一个引号后面是否还有内容
+            if last_quote_pos >= 0 and last_quote_pos < len(json_str) - 1:
+                # 在字符串末尾添加引号
+                json_str += '"'
+            else:
+                # 如果最后一个字符就是引号，可能是其他问题
+                json_str += '"'
+            fixed = True
+            debug_log("JSON修复: 添加了缺失的闭合引号")
+        
+        # 修复4: 处理特殊情况 - 数组元素后缺少逗号或括号
+        # 例如: [1, 2, 3 缺少 ]
+        # 这个情况已经在修复1中处理
+        
+        if fixed:
+            logger.info(f"JSON格式已自动修复")
+            debug_log(f"修复前: {original_str[:200]}...")
+            debug_log(f"修复后: {json_str[:200]}...")
+            
+            # 验证修复后的JSON是否平衡
+            final_open_braces = json_str.count('{')
+            final_close_braces = json_str.count('}')
+            final_open_brackets = json_str.count('[')
+            final_close_brackets = json_str.count(']')
+            
+            if final_open_braces != final_close_braces:
+                logger.warning(f"修复后大括号仍不平衡: 开={final_open_braces}, 闭={final_close_braces}")
+            if final_open_brackets != final_close_brackets:
+                logger.warning(f"修复后方括号仍不平衡: 开={final_open_brackets}, 闭={final_close_brackets}")
+        
+        return json_str
+
     async def select_text_blocks(self, blocks: List[Tuple[int, str]], url: str) -> Dict[str, Any]:
         if not blocks:
             return {
@@ -308,13 +410,16 @@ class LLMApiClient:
         retry_count = 0
         # 429 错误的循环轮换次数（无限制，直到成功或遇到其他错误）
         rate_limit_cycle_count = 0
+        # JSON解析失败的重试次数（独立计数）
+        json_parse_retry = 0
+        max_json_retries = 3  # JSON解析失败最多重试3次
 
         while retry_count < max_retries:
             current_model = self.get_current_model()
             
             try:
                 logger.info(f"使用模型: {current_model} - URL: {url[:80]}...")
-                debug_log(f"尝试 #{retry_count + 1}, 429轮换 #{rate_limit_cycle_count}, 模型: {current_model}")
+                debug_log(f"尝试 #{retry_count + 1}, 429轮换 #{rate_limit_cycle_count}, JSON重试 #{json_parse_retry}, 模型: {current_model}")
                 
                 response = await self.client.chat.completions.create(
                     model=current_model,
@@ -354,6 +459,14 @@ class LLMApiClient:
                 
                 if not json_str:
                     logger.error(f"无法从LLM响应中提取JSON {url}, 原始内容: {content[:200]}")
+                    
+                    # JSON提取失败，重新提交任务
+                    if json_parse_retry < max_json_retries:
+                        json_parse_retry += 1
+                        logger.warning(f"JSON提取失败，重新提交任务 (第{json_parse_retry}/{max_json_retries}次)")
+                        await asyncio.sleep(1)
+                        continue
+                    
                     return {
                         "status": "error",
                         "title_indices": [],
@@ -363,29 +476,54 @@ class LLMApiClient:
                     }
 
                 try:
+                    # 先尝试直接解析
                     parsed = json.loads(json_str)
-                    status = (parsed.get("status") or "").lower()
-                    message = parsed.get("message", "")
-                    debug_log(f"LLM解析状态: {status}, message: {message}")
-                    return {
-                        "status": status,
-                        "title_indices": parsed.get("title_indices", []),
-                        "content_indices": parsed.get("content_indices", []),
-                        "message": message,
-                        "error": "" if status == "success" else (message or "LLM返回非成功状态")
-                    }
+                    
                 except json.JSONDecodeError as e:
-                    logger.error(f"JSON解析失败 {url}: {e}")
-                    logger.error(f"提取的JSON字符串: {json_str[:500]}")
-                    logger.error(f"原始LLM响应: {content[:500]}")
-                    logger.error(f"使用模型: {current_model}")
-                    return {
-                        "status": "error",
-                        "title_indices": [],
-                        "content_indices": [],
-                        "message": f"JSON解析失败: {str(e)}",
-                        "error": f"JSON解析失败: {str(e)}"
-                    }
+                    logger.warning(f"JSON解析失败，尝试自动修复: {e}")
+                    logger.warning(f"原始JSON: {json_str[:300]}...")
+                    
+                    # 尝试修复JSON格式
+                    fixed_json_str = self.fix_json_format(json_str)
+                    
+                    try:
+                        # 尝试解析修复后的JSON
+                        parsed = json.loads(fixed_json_str)
+                        logger.info("JSON自动修复成功")
+                        
+                    except json.JSONDecodeError as e2:
+                        logger.error(f"JSON修复后仍然解析失败: {e2}")
+                        logger.error(f"修复后的JSON: {fixed_json_str[:300]}...")
+                        
+                        # JSON解析失败，重新提交任务
+                        if json_parse_retry < max_json_retries:
+                            json_parse_retry += 1
+                            logger.warning(f"JSON解析失败，重新提交任务 (第{json_parse_retry}/{max_json_retries}次)")
+                            logger.warning(f"原始LLM响应: {content[:500]}")
+                            await asyncio.sleep(1)
+                            continue
+                        
+                        # 达到最大重试次数，返回错误
+                        return {
+                            "status": "error",
+                            "title_indices": [],
+                            "content_indices": [],
+                            "message": f"JSON解析失败: {str(e2)}",
+                            "error": f"JSON解析失败: {str(e2)}"
+                        }
+                
+                # 解析成功，处理结果
+                status = (parsed.get("status") or "").lower()
+                message = parsed.get("message", "")
+                debug_log(f"LLM解析状态: {status}, message: {message}")
+                
+                return {
+                    "status": status,
+                    "title_indices": parsed.get("title_indices", []),
+                    "content_indices": parsed.get("content_indices", []),
+                    "message": message,
+                    "error": "" if status == "success" else (message or "LLM返回非成功状态")
+                }
 
             except asyncio.TimeoutError:
                 error_msg = f"LLM API调用超时 (模型: {current_model})"
@@ -892,7 +1030,7 @@ class ZJCrawler:
                     debug_log(f"跳过处理，页面内容无效: {result.url}")
                     return result
                 
-                # 预检查HTML中是否包含中文内容（避免正则表达式）
+                # 预检查HTML中是否包含中文内容（避免正则回溯）
                 def contains_chinese(text: str) -> bool:
                     for char in text:
                         if '\u4e00' <= char <= '\u9fff':
@@ -910,44 +1048,81 @@ class ZJCrawler:
                     debug_log(f"跳过处理，未提取到文本块: {result.url}")
                     return result
 
-                llm_result = await self.llm_client.select_text_blocks(blocks, result.url)
-                if llm_result.get("status") != "success":
-                    result.error = llm_result.get("error") or llm_result.get("message") or "LLM未返回成功状态"
-                    debug_log(f"LLM分析失败: {result.error}")
-                    return result
-
-                block_map = {idx: text for idx, text in blocks}
-
-                def normalize_indices(raw_indices):
-                    """解析索引，支持区间表示法"""
-                    normalized = []
-                    for item in raw_indices or []:
-                        # 处理区间 [start, end]
-                        if isinstance(item, list) and len(item) == 2:
-                            try:
-                                start, end = int(item[0]), int(item[1])
-                                for idx in range(start, end + 1):
-                                    if idx in block_map and idx not in normalized:
-                                        normalized.append(idx)
-                            except (TypeError, ValueError) as e:
-                                debug_log(f"解析区间失败 {item}: {e}")
-                                continue
-                        # 处理单个编号
+                # LLM任务重试配置
+                max_llm_retries = 3  # LLM任务最多重试3次
+                llm_retry_count = 0
+                llm_result = None
+                
+                # 重试循环：针对LLM相关错误
+                while llm_retry_count <= max_llm_retries:
+                    llm_result = await self.llm_client.select_text_blocks(blocks, result.url)
+                    
+                    # 检查LLM返回状态
+                    if llm_result.get("status") != "success":
+                        llm_error = llm_result.get("error") or llm_result.get("message") or "LLM未返回成功状态"
+                        
+                        if llm_retry_count < max_llm_retries:
+                            llm_retry_count += 1
+                            logger.warning(f"LLM分析失败，重新提交任务 (第{llm_retry_count}/{max_llm_retries}次): {llm_error}")
+                            logger.warning(f"URL: {result.url}")
+                            await asyncio.sleep(1)
+                            continue
                         else:
-                            try:
-                                value = int(item)
-                                if value in block_map and value not in normalized:
-                                    normalized.append(value)
-                            except (TypeError, ValueError) as e:
-                                debug_log(f"解析单个编号失败 {item}: {e}")
-                                continue
-                    return normalized
+                            result.error = llm_error
+                            debug_log(f"LLM分析失败，已重试{max_llm_retries}次: {result.error}")
+                            return result
+                    
+                    # 解析索引
+                    block_map = {idx: text for idx, text in blocks}
 
-                title_indices = normalize_indices(llm_result.get("title_indices"))
-                content_indices = normalize_indices(llm_result.get("content_indices"))
+                    def normalize_indices(raw_indices):
+                        """解析索引，支持区间表示法"""
+                        normalized = []
+                        for item in raw_indices or []:
+                            # 处理区间 [start, end]
+                            if isinstance(item, list) and len(item) == 2:
+                                try:
+                                    start, end = int(item[0]), int(item[1])
+                                    for idx in range(start, end + 1):
+                                        if idx in block_map and idx not in normalized:
+                                            normalized.append(idx)
+                                except (TypeError, ValueError) as e:
+                                    debug_log(f"解析区间失败 {item}: {e}")
+                                    continue
+                            # 处理单个编号
+                            else:
+                                try:
+                                    value = int(item)
+                                    if value in block_map and value not in normalized:
+                                        normalized.append(value)
+                                except (TypeError, ValueError) as e:
+                                    debug_log(f"解析单个编号失败 {item}: {e}")
+                                    continue
+                        return normalized
 
-                debug_log(f"标题编号: {title_indices}, 正文编号: {content_indices}")
+                    title_indices = normalize_indices(llm_result.get("title_indices"))
+                    content_indices = normalize_indices(llm_result.get("content_indices"))
 
+                    debug_log(f"标题编号: {title_indices}, 正文编号: {content_indices}")
+
+                    # 检查是否有正文编号
+                    if not content_indices:
+                        if llm_retry_count < max_llm_retries:
+                            llm_retry_count += 1
+                            logger.warning(f"LLM未返回正文编号，重新提交任务 (第{llm_retry_count}/{max_llm_retries}次)")
+                            logger.warning(f"URL: {result.url}")
+                            logger.warning(f"LLM返回的content_indices: {llm_result.get('content_indices')}")
+                            await asyncio.sleep(1)
+                            continue
+                        else:
+                            result.error = "LLM未返回正文编号"
+                            debug_log(f"LLM未返回正文编号，已重试{max_llm_retries}次")
+                            return result
+                    
+                    # 成功获取到正文编号，跳出重试循环
+                    break
+                
+                # 提取标题和正文
                 title_text = " ".join(block_map[idx] for idx in title_indices).strip() if title_indices else ""
                 if title_text:
                     result.title = title_text
@@ -956,7 +1131,8 @@ class ZJCrawler:
                 result.content = "\n\n".join(content_segments).strip()
 
                 if not result.content:
-                    result.error = "LLM未返回正文编号"
+                    result.error = "提取的正文为空"
+                    debug_log(f"提取的正文为空: {result.url}")
                 # elif len(result.content) < 100:
                 #     result.error = "提取的正文过短"
                 else:
@@ -1572,6 +1748,7 @@ class ZJCrawler:
                                     continue
 
                         logger.info(f"完成城市: {city_name}")
+
                         network_logger.info(f"===== 完成城市: {city_name} =====")
 
                 finally:

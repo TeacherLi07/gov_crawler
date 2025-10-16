@@ -6,3 +6,4 @@ lib64
 *.log*
 browser_cache/
 results/
+models/
