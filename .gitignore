@@ -7,3 +7,4 @@ lib64
 browser_cache/
 results/
 models/
+logs/

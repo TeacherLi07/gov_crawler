@@ -51,7 +51,7 @@ logging.basicConfig(
     level=logging.DEBUG if DEBUG else logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('crawler.log'),
+        logging.FileHandler('logs/crawler.log'),
         logging.StreamHandler()
     ]
 )
@@ -60,7 +60,7 @@ logger = logging.getLogger(__name__)
 # 创建网络请求专用日志记录器
 network_logger = logging.getLogger('network')
 network_logger.setLevel(logging.DEBUG)
-network_handler = logging.FileHandler('network.log', encoding='utf-8')
+network_handler = logging.FileHandler('logs/network.log', encoding='utf-8')
 network_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
 network_logger.addHandler(network_handler)
 network_logger.propagate = False  # 防止重复记录到主日志
@@ -306,9 +306,15 @@ class SearchResultFetcher:
             
             return results, total_pages
             
+        except Exception as e:
+            logger.error(f"搜索页面处理失败: {str(e)}")
+            raise
         finally:
-            await page.close()
-
+            if page:
+                try:
+                    await page.close()
+                except Exception as e:
+                    logger.warning(f"关闭页面失败: {str(e)}")
 
 class LLMApiClient:
     """LLM API客户端，使用OpenAI SDK调用SiliconFlow服务"""
@@ -990,7 +996,6 @@ class CrawlerOrchestrator:
                     result, blocks = await self.content_extractor.extract_content(task)
                     
                     if result.error == "URL已存在，跳过处理":
-                        self.content_queue.task_done()
                         continue
                     
                     if result.error or not blocks:
@@ -1110,41 +1115,56 @@ class CrawlerOrchestrator:
     
     async def wait_all_complete(self):
         """等待所有任务完成"""
-        logger.info("等待所有搜索任务完成...")
-        await self.search_queue.join()
-        
-        # 发送搜索结束信号
-        for worker in self.workers:
-            if not worker.done() and 'search_worker' in str(worker):
+        try:
+            logger.info("等待所有搜索任务完成...")
+            await self.search_queue.join()
+            
+            # 发送搜索结束信号
+            for _ in range(len([w for w in self.workers if 'search_worker' in str(w)])):
                 await self.search_queue.put(None)
-        
-        logger.info("等待所有内容提取任务完成...")
-        await self.content_queue.join()
-        
-        # 发送内容提取结束信号
-        for worker in self.workers:
-            if not worker.done() and 'content_worker' in str(worker):
+            
+            # 等待搜索工作器完成
+            search_workers = [w for w in self.workers if 'search_worker' in str(w)]
+            await asyncio.gather(*search_workers, return_exceptions=True)
+            
+            logger.info("等待所有内容提取任务完成...")
+            await self.content_queue.join()
+            
+            # 发送内容提取结束信号
+            for _ in range(len([w for w in self.workers if 'content_worker' in str(w)])):
                 await self.content_queue.put(None)
-        
-        logger.info("等待所有分析任务完成...")
-        await self.analysis_queue.join()
-        
-        # 发送分析结束信号
-        for worker in self.workers:
-            if not worker.done() and 'analysis_worker' in str(worker):
+                
+            # 等待内容提取工作器完成    
+            content_workers = [w for w in self.workers if 'content_worker' in str(w)]
+            await asyncio.gather(*content_workers, return_exceptions=True)
+            
+            logger.info("等待所有分析任务完成...")
+            await self.analysis_queue.join()
+            
+            # 发送分析结束信号
+            for _ in range(len([w for w in self.workers if 'analysis_worker' in str(w)])):
                 await self.analysis_queue.put(None)
-        
-        logger.info("等待所有保存任务完成...")
-        await self.save_queue.join()
-        
-        # 发送保存结束信号
-        for worker in self.workers:
-            if not worker.done() and 'save_worker' in str(worker):
+                
+            # 等待分析工作器完成
+            analysis_workers = [w for w in self.workers if 'analysis_worker' in str(w)]
+            await asyncio.gather(*analysis_workers, return_exceptions=True)
+            
+            logger.info("等待所有保存任务完成...")
+            await self.save_queue.join()
+            
+            # 发送保存结束信号
+            for _ in range(len([w for w in self.workers if 'save_worker' in str(w)])):
                 await self.save_queue.put(None)
-        
-        # 等待所有工作器结束
-        await asyncio.gather(*self.workers, return_exceptions=True)
-        logger.info("所有任务已完成")
+                
+            # 等待保存工作器完成
+            save_workers = [w for w in self.workers if 'save_worker' in str(w)]
+            await asyncio.gather(*save_workers, return_exceptions=True)
+            
+            logger.info("所有工作器任务已完成")
+            
+        except Exception as e:
+            logger.error(f"等待任务完成时出错: {e}")
+            raise
 
 
 class ZJCrawler:
