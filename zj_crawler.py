@@ -135,6 +135,33 @@ class SaveTask:
     keyword: str
 
 
+# ✅ 新增：城市对任务追踪器
+@dataclass
+class CityPairTracker:
+    """城市对任务追踪器"""
+    city_name: str
+    keyword: str
+    total_urls: int = 0  # 搜索到的总URL数（包括已存在的）
+    new_urls: int = 0    # 需要处理的新URL数
+    completed_urls: int = 0  # 已完成处理的URL数
+    failed_urls: int = 0     # 失败的URL数
+    skipped_urls: int = 0    # 跳过的URL数（已存在）
+    search_completed: bool = False  # 搜索阶段是否完成
+    
+    def is_fully_completed(self) -> bool:
+        """判断是否完全完成（搜索完成且所有新URL已处理）"""
+        if not self.search_completed:
+            return False
+        # 所有新URL都应该被处理（成功或失败）
+        return (self.completed_urls + self.failed_urls) >= self.new_urls
+    
+    def get_progress_info(self) -> str:
+        """获取进度信息字符串"""
+        return (f"总URL:{self.total_urls}, 新URL:{self.new_urls}, "
+                f"已完成:{self.completed_urls}, 失败:{self.failed_urls}, "
+                f"跳过:{self.skipped_urls}, 搜索完成:{self.search_completed}")
+
+
 # 应用程序的主要逻辑类
 class SearchResultFetcher:
     """搜索结果获取器 - 负责从搜索页获取结果列表"""
@@ -449,11 +476,10 @@ class LLMApiClient:
                 else:
                     self.sf_all_models_429 = False  # 重置429状态
                     logger.info("SF API解除全局429状态，恢复正常冷却时间")
-            else:
-                # 正常2秒冷却
-                time_since_last_call = current_time - self.sf_last_call_time
-                if time_since_last_call < 2:
-                    await asyncio.sleep(2 - time_since_last_call)
+            # 正常2秒冷却
+            time_since_last_call = current_time - self.sf_last_call_time
+            if time_since_last_call < 2:
+                await asyncio.sleep(2 - time_since_last_call)
 
         try:
             current_model = self.SF_MODELS[self.sf_model_index]
@@ -883,6 +909,7 @@ class CrawlerOrchestrator:
         context: BrowserContext,
         llm_client: LLMApiClient,
         results_dir: Path,
+        progress_manager,  # ✅ 新增：进度管理器
         max_concurrent_search: int = 5,
         max_concurrent_content: int = 128,
         max_concurrent_analysis: int = 128,
@@ -895,6 +922,7 @@ class CrawlerOrchestrator:
         self.content_extractor = ContentExtractor(context)
         self.llm_analyzer = LLMAnalyzer(llm_client)
         self.result_saver = ResultSaver(results_dir)
+        self.progress_manager = progress_manager  # ✅ 新增
         
         # 各阶段的信号量
         self.search_sem = asyncio.Semaphore(max_concurrent_search)
@@ -911,6 +939,10 @@ class CrawlerOrchestrator:
         # URL缓存
         self.url_cache: Dict[Tuple[str, str], Set[str]] = {}
         self.url_cache_lock = asyncio.Lock()
+        
+        # ✅ 新增：城市对追踪器
+        self.city_pair_trackers: Dict[Tuple[str, str], CityPairTracker] = {}
+        self.tracker_lock = asyncio.Lock()
         
         # 工作器任务列表
         self.workers = []
@@ -940,6 +972,29 @@ class CrawlerOrchestrator:
             self.url_cache[cache_key] = set()
             return self.url_cache[cache_key]
     
+    # ✅ 新增：获取或创建城市对追踪器
+    async def get_or_create_tracker(self, city_name: str, keyword: str) -> CityPairTracker:
+        """获取或创建城市对追踪器"""
+        cache_key = (city_name, keyword)
+        async with self.tracker_lock:
+            if cache_key not in self.city_pair_trackers:
+                self.city_pair_trackers[cache_key] = CityPairTracker(
+                    city_name=city_name,
+                    keyword=keyword
+                )
+            return self.city_pair_trackers[cache_key]
+    
+    # ✅ 新增：检查并标记城市对完成
+    async def check_and_mark_completed(self, city_name: str, keyword: str):
+        """检查城市对是否完成，如果完成则标记并保存进度"""
+        tracker = await self.get_or_create_tracker(city_name, keyword)
+        
+        if tracker.is_fully_completed():
+            # 标记完成并保存进度
+            self.progress_manager.mark_city_pair_completed(city_name, keyword)
+            logger.info(f"✓✓✓ 城市对已完成: {city_name} -> {keyword}")
+            logger.info(f"    {tracker.get_progress_info()}")
+    
     async def search_worker(self):
         """搜索任务工作器"""
         while True:
@@ -953,7 +1008,21 @@ class CrawlerOrchestrator:
                     
                     existing_urls = self.load_existing_urls(task.city_name, task.keyword)
                     
+                    # ✅ 新增：更新追踪器
+                    tracker = await self.get_or_create_tracker(task.city_name, task.keyword)
+                    
+                    # 统计新URL和跳过的URL
+                    new_results = []
                     for result in results:
+                        tracker.total_urls += 1
+                        if result.url in existing_urls:
+                            tracker.skipped_urls += 1
+                        else:
+                            tracker.new_urls += 1
+                            new_results.append(result)
+                    
+                    # 只处理新URL
+                    for result in new_results:
                         content_task = ContentTask(
                             result=result,
                             city_name=task.city_name,
@@ -973,6 +1042,16 @@ class CrawlerOrchestrator:
                             )
                             await self.search_queue.put(new_task)
                     
+                    # ✅ 新增：如果是最后一页，标记搜索完成
+                    if task.page_num == total_pages or total_pages == 0:
+                        tracker.search_completed = True
+                        logger.info(f"搜索完成: {task.city_name} -> {task.keyword}, "
+                                  f"共{tracker.total_urls}个URL, 其中{tracker.new_urls}个新URL")
+                        
+                        # 如果没有新URL需要处理，直接检查是否完成
+                        if tracker.new_urls == 0:
+                            await self.check_and_mark_completed(task.city_name, task.keyword)
+                    
                 except Exception as e:
                     logger.error(f"搜索任务失败: {e}")
                 finally:
@@ -989,8 +1068,7 @@ class CrawlerOrchestrator:
                 try:
                     result, blocks = await self.content_extractor.extract_content(task)
                     
-                    if result.error == "URL已存在，跳过处理":
-                        continue
+                    # ✅ 修复：移除跳过URL的逻辑（已在search_worker中处理）
                     
                     if result.error or not blocks:
                         # 直接保存错误结果
@@ -1049,13 +1127,22 @@ class CrawlerOrchestrator:
                 try:
                     await self.result_saver.save_result(task)
                     
-                    # 更新URL缓存
-                    if not task.result.error:
+                    # ✅ 新增：更新追踪器
+                    tracker = await self.get_or_create_tracker(task.city_name, task.keyword)
+                    
+                    if task.result.error:
+                        tracker.failed_urls += 1
+                    else:
+                        tracker.completed_urls += 1
+                        # 更新URL缓存
                         async with self.url_cache_lock:
                             cache_key = (task.city_name, task.keyword)
                             if cache_key not in self.url_cache:
                                 self.url_cache[cache_key] = set()
                             self.url_cache[cache_key].add(task.result.url)
+                    
+                    # ✅ 新增：检查是否完成
+                    await self.check_and_mark_completed(task.city_name, task.keyword)
                     
                 except Exception as e:
                     logger.error(f"保存任务失败: {e}")
@@ -1161,6 +1248,80 @@ class CrawlerOrchestrator:
             raise
 
 
+# ✅ 新增：进度管理器类
+class ProgressManager:
+    """进度管理器 - 负责管理和持久化爬取进度"""
+    
+    def __init__(self, progress_file: Path):
+        self.progress_file = progress_file
+        self.progress: Dict[str, Dict[str, bool]] = {}
+        self.progress_lock = asyncio.Lock()
+        self.load_progress()
+    
+    def load_progress(self) -> Dict[str, Dict[str, bool]]:
+        """加载爬取进度"""
+        if not self.progress_file.exists():
+            logger.info("未找到进度文件，将从头开始爬取")
+            self.progress = {}
+            return self.progress
+        
+        try:
+            with open(self.progress_file, 'r', encoding='utf-8') as f:
+                self.progress = json.load(f)
+            logger.info(f"已加载进度文件，包含 {len(self.progress)} 个源城市的记录")
+            
+            # 统计已完成的任务数
+            total_completed = sum(
+                sum(1 for completed in cities.values() if completed)
+                for cities in self.progress.values()
+            )
+            logger.info(f"已完成 {total_completed} 个城市对")
+            
+            return self.progress
+        except Exception as e:
+            logger.error(f"加载进度文件失败: {e}，将从头开始爬取")
+            self.progress = {}
+            return self.progress
+    
+    def save_progress(self):
+        """保存爬取进度（同步版本，用于内部调用）"""
+        try:
+            # ✅ 修复：使用临时文件避免写入过程中文件损坏
+            temp_file = self.progress_file.with_suffix('.json.tmp')
+            with open(temp_file, 'w', encoding='utf-8') as f:
+                json.dump(self.progress, f, ensure_ascii=False, indent=2)
+            
+            # 原子性重命名
+            temp_file.replace(self.progress_file)
+            
+        except Exception as e:
+            logger.error(f"保存进度文件失败: {e}")
+    
+    def is_city_pair_completed(self, source_city: str, target_city: str) -> bool:
+        """检查城市对是否已完成"""
+        if source_city not in self.progress:
+            return False
+        return self.progress[source_city].get(target_city, False)
+    
+    def mark_city_pair_completed(self, source_city: str, target_city: str):
+        """标记城市对为已完成（同步版本）"""
+        if source_city not in self.progress:
+            self.progress[source_city] = {}
+        self.progress[source_city][target_city] = True
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        logger.info(f"✓ 完成标记: {source_city} -> {target_city} (时间: {timestamp})")
+        self.save_progress()
+    
+    def get_completion_stats(self) -> Tuple[int, int]:
+        """获取完成统计信息"""
+        total_completed = sum(
+            sum(1 for completed in cities.values() if completed)
+            for cities in self.progress.values()
+        )
+        total_cities = sum(len(cities) for cities in self.progress.values())
+        return total_completed, total_cities
+
+
 class ZJCrawler:
     """浙江省政府网站爬虫 - 连续爬取版本"""
 
@@ -1176,7 +1337,9 @@ class ZJCrawler:
         self.results_dir = Path("results")
         self.results_dir.mkdir(exist_ok=True)
         
+        # ✅ 修复：使用ProgressManager管理进度
         self.progress_file = Path("crawl_progress.json")
+        self.progress_manager = ProgressManager(self.progress_file)
 
         self.zj_cities = {
             "杭州市": {"code": "3301", "websiteid": "330100000000000", "sitecode": "330101000000"},
@@ -1233,46 +1396,6 @@ class ZJCrawler:
             logger.error(f"读取API key失败: {e}")
             raise
 
-    def load_progress(self) -> Dict[str, Dict[str, bool]]:
-        """加载爬取进度"""
-        if not self.progress_file.exists():
-            logger.info("未找到进度文件，将从头开始爬取")
-            return {}
-        
-        try:
-            with open(self.progress_file, 'r', encoding='utf-8') as f:
-                progress_data = json.load(f)
-            logger.info(f"已加载进度文件，包含 {len(progress_data)} 个源城市的记录")
-            return progress_data
-        except Exception as e:
-            logger.error(f"加载进度文件失败: {e}，将从头开始爬取")
-            return {}
-
-    def save_progress(self, progress: Dict[str, Dict[str, bool]]):
-        """保存爬取进度"""
-        try:
-            with open(self.progress_file, 'w', encoding='utf-8') as f:
-                json.dump(progress, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            logger.error(f"保存进度文件失败: {e}")
-
-    def is_city_pair_completed(self, progress: Dict[str, Dict[str, bool]], 
-                                source_city: str, target_city: str) -> bool:
-        """检查城市对是否已完成"""
-        if source_city not in progress:
-            return False
-        return progress[source_city].get(target_city, False)
-
-    def mark_city_pair_completed(self, progress: Dict[str, Dict[str, bool]], 
-                                  source_city: str, target_city: str):
-        """标记城市对为已完成"""
-        if source_city not in progress:
-            progress[source_city] = {}
-        progress[source_city][target_city] = True
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        logger.info(f"✓ 完成: {source_city} -> {target_city} (时间: {timestamp})")
-        self.save_progress(progress)
-
     async def run_crawler(self, cities_csv_file: str):
         """运行爬虫主程序 - 连续爬取版本"""
         logger.info("=" * 80)
@@ -1290,7 +1413,9 @@ class ZJCrawler:
             logger.error("无法加载目标城市列表")
             return
 
-        progress = self.load_progress()
+        # ✅ 使用ProgressManager
+        completed, total = self.progress_manager.get_completion_stats()
+        logger.info(f"当前进度: {completed}/{total} 个城市对已完成")
 
         async with LLMApiClient(llm_api_key) as llm_client:
             self.llm_client = llm_client
@@ -1332,10 +1457,12 @@ class ZJCrawler:
                     timezone_id="Asia/Shanghai",
                 )
 
+                # ✅ 传递ProgressManager给orchestrator
                 orchestrator = CrawlerOrchestrator(
                     context=self.context,
                     llm_client=llm_client,
                     results_dir=self.results_dir,
+                    progress_manager=self.progress_manager,
                     max_concurrent_search=3,
                     max_concurrent_content=128,
                     max_concurrent_analysis=128,
@@ -1361,10 +1488,16 @@ class ZJCrawler:
 
                         for target_city in target_cities:
                             target_city_name = str(target_city).strip()
-                            if not target_city_name or target_city_name in city_name or city_name in target_city_name:
+                            # ✅ 修复：正确的过滤逻辑
+                            if not target_city_name:
                                 continue
                             
-                            if self.is_city_pair_completed(progress, city_name, target_city_name):
+                            # 跳过相同或包含关系的城市
+                            if target_city_name in city_name or city_name in target_city_name:
+                                continue
+                            
+                            # ✅ 使用ProgressManager检查完成状态
+                            if self.progress_manager.is_city_pair_completed(city_name, target_city_name):
                                 skipped_tasks += 1
                                 if skipped_tasks % 100 == 0:
                                     logger.info(f"已跳过 {skipped_tasks} 个已完成任务")
@@ -1400,8 +1533,12 @@ class ZJCrawler:
                                 analysis_size = orchestrator.analysis_queue.qsize()
                                 save_size = orchestrator.save_queue.qsize()
                                 
+                                # ✅ 新增：显示完成统计
+                                completed, total = self.progress_manager.get_completion_stats()
+                                
                                 logger.info("=" * 80)
                                 logger.info(f"队列状态: 搜索={search_size}, 内容={content_size}, 分析={analysis_size}, 保存={save_size}")
+                                logger.info(f"完成进度: {completed} 个城市对已完成")
                                 logger.info("=" * 80)
                                 
                                 last_report_time = current_time
@@ -1424,16 +1561,13 @@ class ZJCrawler:
                     except asyncio.CancelledError:
                         pass
                     
-                    # 标记所有已处理的城市对为完成
-                    logger.info("更新进度记录...")
-                    for city_name in self.zj_cities.keys():
-                        for target_city in target_cities:
-                            target_city_name = str(target_city).strip()
-                            if target_city_name and target_city_name != city_name:
-                                self.mark_city_pair_completed(progress, city_name, target_city_name)
+                    # ✅ 移除：不再需要在最后批量标记所有城市对
+                    # 因为已经在save_worker中实时标记了
                     
                     logger.info("=" * 80)
                     logger.info("所有爬取任务已完成！")
+                    completed, total = self.progress_manager.get_completion_stats()
+                    logger.info(f"最终统计: {completed} 个城市对已完成")
                     logger.info("=" * 80)
 
                 finally:
