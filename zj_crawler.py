@@ -20,6 +20,7 @@ from bs4 import BeautifulSoup
 import shutil
 
 USE_LOCAL_VLLM = True
+USE_SF_API = True
 
 # 自定义 DNS 缓存映射
 DNS_OVERRIDE = {
@@ -319,12 +320,19 @@ class SearchResultFetcher:
 class LLMApiClient:
     """LLM API客户端，使用OpenAI SDK调用SiliconFlow服务"""
 
-    # 添加类级别的变量和锁
-    last_call_time = 0
-    call_lock = asyncio.Lock()
+    # 分别为两个API维护调用时间和锁
+    vllm_last_call_time = 0
+    sf_last_call_time = 0
+    vllm_lock = asyncio.Lock()
+    sf_lock = asyncio.Lock()
+
+    # 是否所有SF模型都在429状态
+    sf_all_models_429 = False
+    sf_429_start_time = 0
 
     # 可用模型列表，按优先级排序
-    AVAILABLE_MODELS = ["models/qwen3-14b-awq"] if USE_LOCAL_VLLM else [
+    VLLM_MODELS = ["models/qwen3-14b-awq"]
+    SF_MODELS = [
         "Qwen/Qwen3-8B",
         "deepseek-ai/DeepSeek-R1-0528-Qwen3-8B",
         "Qwen/Qwen2.5-7B-Instruct",
@@ -332,51 +340,38 @@ class LLMApiClient:
     ]
 
     def __init__(self, api_key: str, base_url: str = "http://localhost:8000/v1" if USE_LOCAL_VLLM else "https://api.siliconflow.cn/"):
-        self.client = AsyncOpenAI(
-            api_key=api_key,
-            base_url=base_url
-        )
-        self.current_model_index = 0
-        self.model_usage_count = {model: 0 for model in self.AVAILABLE_MODELS}
+        if USE_LOCAL_VLLM:
+            self.vllm_client = AsyncOpenAI(
+                api_key=api_key,
+                base_url="http://localhost:8000/v1"
+            )
+        if USE_SF_API:
+            self.sf_client = AsyncOpenAI(
+                api_key=api_key,
+                base_url="https://api.siliconflow.cn/"
+            )
+        
+        self.sf_model_index = 0
+        self.sf_model_usage_count = {model: 0 for model in self.SF_MODELS}
         self.model_switch_lock = asyncio.Lock()
         self.last_429_model = None
-        self.model_429_count = {model: 0 for model in self.AVAILABLE_MODELS}
+        self.model_429_count = {model: 0 for model in self.SF_MODELS}
 
     async def __aenter__(self):
         return self
 
     async def __aexit__(self, exc_type, exc, tb):
-        logger.info("模型使用统计:")
-        for model, count in self.model_usage_count.items():
-            logger.info(f"  {model}: {count} 次")
-        
-        logger.info("模型429错误统计:")
-        for model, count in self.model_429_count.items():
-            if count > 0:
+        if USE_SF_API:
+            logger.info("SiliconFlow API模型使用统计:")
+            for model, count in self.sf_model_usage_count.items():
                 logger.info(f"  {model}: {count} 次")
-        
+            
+            logger.info("SiliconFlow API模型429错误统计:")
+            for model, count in self.model_429_count.items():
+                if count > 0:
+                    logger.info(f"  {model}: {count} 次")
         return False
-
-    def get_current_model(self) -> str:
-        """获取当前使用的模型"""
-        return self.AVAILABLE_MODELS[self.current_model_index]
-
-    async def switch_model(self):
-        """切换到下一个可用模型"""
-        async with self.model_switch_lock:
-            self.current_model_index = (self.current_model_index + 1) % len(self.AVAILABLE_MODELS)
-            logger.info(f"切换到新模型: {self.get_current_model()}")
-
-    async def handle_rate_limit_error(self, current_model: str) -> str:
-        """处理速率限制错误，尝试切换模型或等待"""
-        if current_model == self.last_429_model:
-            # 连续两次429错误，切换模型
-            await self.switch_model()
-        else:
-            self.last_429_model = current_model
-        
-        return self.get_current_model()
-
+    
     def extract_json_from_response(self, response: str) -> str:
         """从LLM的响应中提取JSON字符串"""
         try:
@@ -406,15 +401,111 @@ class LLMApiClient:
         
         return json_str
 
-    async def select_text_blocks(self, blocks: List[Tuple[int, str]], url: str) -> Dict[str, Any]:
-        """选择文本块"""
-        # 使用类级别的锁控制调用间隔
-        async with self.__class__.call_lock:
+    async def try_vllm_api(self, prompt: str) -> Optional[str]:
+        """尝试使用VLLM API"""
+        if not USE_LOCAL_VLLM:
+            return None
+
+        try:
+            response = await self.vllm_client.chat.completions.create(
+                model=self.VLLM_MODELS[0],
+                messages=[
+                    {"role": "system", "content": "You are a helpful assistant designed to output JSON."},
+                    {"role": "user", "content": prompt}
+                ],
+                max_tokens=512,
+                temperature=0.2,
+                frequency_penalty=0.15,
+                stream=True,
+                timeout=300,
+                extra_body={"chat_template_kwargs": {"enable_thinking": False}}
+            )
+
+            content = ""
+            async for chunk in response:
+                delta = chunk.choices[0].delta if chunk.choices else None
+                if delta and delta.content:
+                    content += delta.content
+
+            return content if content.strip() else None
+
+        except Exception as e:
+            logger.warning(f"VLLM API调用失败: {e}")
+            return None
+
+    async def try_sf_api(self, prompt: str) -> Optional[str]:
+        """尝试使用SiliconFlow API"""
+        if not USE_SF_API:
+            return None
+
+        async with self.sf_lock:
             current_time = time.time()
-            time_since_last_call = current_time - self.__class__.last_call_time
-            if time_since_last_call < 0.2:  # 0.2秒间隔
-                await asyncio.sleep(0.2 - time_since_last_call)
-            self.__class__.last_call_time = time.time()
+            
+            # 检查是否所有模型都在429状态
+            if self.sf_all_models_429:
+                time_in_429 = current_time - self.sf_429_start_time
+                if time_in_429 < 60:  # 60秒冷却
+                    await asyncio.sleep(60 - time_in_429)
+                else:
+                    self.sf_all_models_429 = False  # 重置429状态
+                    logger.info("SF API解除全局429状态，恢复正常冷却时间")
+            else:
+                # 正常2秒冷却
+                time_since_last_call = current_time - self.sf_last_call_time
+                if time_since_last_call < 2:
+                    await asyncio.sleep(2 - time_since_last_call)
+
+        try:
+            current_model = self.SF_MODELS[self.sf_model_index]
+            
+            response = await self.sf_client.chat.completions.create(
+                model=current_model,
+                messages=[
+                    {"role": "system", "content": "You are a helpful assistant designed to output JSON."},
+                    {"role": "user", "content": prompt}
+                ],
+                max_tokens=1024,
+                temperature=0.2,
+                frequency_penalty=0.15,
+                stream=True,
+                timeout=300,
+                extra_body={"enable_thinking": False}
+            )
+
+            content = ""
+            async for chunk in response:
+                delta = chunk.choices[0].delta if chunk.choices else None
+                if delta and delta.content:
+                    content += delta.content
+
+            self.sf_model_usage_count[current_model] += 1
+            self.sf_last_call_time = time.time()
+            self.sf_all_models_429 = False  # 成功调用，重置429状态
+            return content if content.strip() else None
+
+        except Exception as e:
+            error_str = str(e)
+            if "429" in error_str or "rate_limit" in error_str.lower():
+                self.model_429_count[current_model] += 1
+                await self.switch_sf_model()
+                
+                # 检查是否所有模型都遇到429
+                all_models_have_429 = all(self.model_429_count[model] > 0 for model in self.SF_MODELS)
+                if all_models_have_429:
+                    self.sf_all_models_429 = True
+                    self.sf_429_start_time = time.time()
+                    logger.warning("所有SF API模型均遇到429，启动60秒全局冷却")
+            
+            return None
+
+    async def switch_sf_model(self):
+        """切换到下一个SF API模型"""
+        async with self.model_switch_lock:
+            self.sf_model_index = (self.sf_model_index + 1) % len(self.SF_MODELS)
+            logger.info(f"切换到新SF模型: {self.SF_MODELS[self.sf_model_index]}")
+
+    async def select_text_blocks(self, blocks: List[Tuple[int, str]], url: str) -> Dict[str, Any]:
+        """选择文本块 - 同时尝试两个API通道"""
         prompt = f"""请分析以下网页文本片段，找出其中的**正文**。
 
 输出要求：
@@ -435,169 +526,72 @@ class LLMApiClient:
         for idx, text in blocks:
             prompt += f"{idx}. {text}\n"
 
-        max_retries = 10
-        retry_count = 0
-        rate_limit_cycle_count = 0
-        json_parse_retry = 0
-        max_json_retries = 5
-
-        while retry_count < max_retries:
-            current_model = self.get_current_model()
+        for attempt in range(10):  # 最多尝试10次
+            # 同时尝试两个API通道
+            tasks = []
             
-            try:
-                logger.info(f"使用模型: {current_model} - URL: {url[:80]}...")
-                
-                response = await self.client.chat.completions.create(
-                    model=current_model,
-                    messages=[
-                        {"role": "system", "content": "You are a helpful assistant designed to output JSON."},
-                        {"role": "user", "content": prompt}
-                    ],
-                    max_tokens=1024,
-                    temperature=0.2,
-                    frequency_penalty=0.15,
-                    stream=True,
-                    timeout=300,
-                    extra_body={"chat_template_kwargs": {"enable_thinking": False}} if USE_LOCAL_VLLM else {"enable_thinking": False}
-                )
+            if USE_LOCAL_VLLM:
+                tasks.append(self.try_vllm_api(prompt))
+            if USE_SF_API:
+                tasks.append(self.try_sf_api(prompt))
+            
+            if not tasks:
+                return {
+                    "success": False,
+                    "content_indices": [],
+                    "error": "未启用任何API"
+                }
 
-                content = ""
-                async for chunk in response:
-                    delta = chunk.choices[0].delta if chunk.choices else None
-                    if delta and delta.content:
-                        content += delta.content
-                
-                self.model_usage_count[current_model] += 1
-                logger.info(f"模型 {current_model} 成功响应 - 长度: {len(content)}")
-
-                if not content.strip():
-                    return {
-                        "success": False,
-                        "content_indices": [],
-                        "error": "LLM返回空内容"
-                    }
-
-                json_str = self.extract_json_from_response(content)
-                
-                if not json_str:
-                    logger.error(f"无法从LLM响应中提取JSON {url}, 原始内容: {content[:200]}")
-                    
-                    if json_parse_retry < max_json_retries:
-                        json_parse_retry += 1
-                        logger.warning(f"JSON提取失败，重新提交任务 (第{json_parse_retry}/{max_json_retries}次)")
-                        await asyncio.sleep(1)
-                        continue
-                    
-                    return {
-                        "success": False,
-                        "content_indices": [],
-                        "error": "无法提取JSON内容"
-                    }
-
+            # 等待第一个成功的结果
+            content = None
+            for task in asyncio.as_completed(tasks):
                 try:
-                    parsed = json.loads(json_str)
-                    
-                except json.JSONDecodeError as e:
-                    logger.warning(f"JSON解析失败，尝试自动修复: {e}")
-                    
-                    fixed_json_str = self.fix_json_format(json_str)
-                    
-                    try:
-                        parsed = json.loads(fixed_json_str)
-                        logger.info("JSON自动修复成功")
-                        
-                    except json.JSONDecodeError as e2:
-                        logger.error(f"JSON修复后仍然解析失败: {e2}")
-                        
-                        if json_parse_retry < max_json_retries:
-                            json_parse_retry += 1
-                            logger.warning(f"JSON解析失败，重新提交任务 (第{json_parse_retry}/{max_json_retries}次)")
-                            await asyncio.sleep(1)
-                            continue
-                        
-                        return {
-                            "success": False,
-                            "content_indices": [],
-                            "error": f"JSON解析失败: {str(e2)}"
-                        }
-                
-                is_success = parsed.get("status") == "success"
-                content_indices = parsed.get("content_indices", [])
-                
-
-                if not content_indices:
-                    # 没有content_indices，可能需要重试
-                    if json_parse_retry < max_json_retries:
-                        json_parse_retry += 1
-                        logger.warning(f"LLM未返回content_indices，重新提交 (第{json_parse_retry}/{max_json_retries}次)")
-                        await asyncio.sleep(1)
-                        continue
-                    else:
-                        return {
-                            "success": False,
-                            "content_indices": [],
-                            "error": "LLM未返回正文编号"
-                        }
-
-                if is_success:
-                    return {
-                        "success": True,
-                        "content_indices": content_indices,
-                        "error": ""
-                    }
-                
-            except asyncio.TimeoutError:
-                error_msg = f"LLM API调用超时 (模型: {current_model})"
-                logger.error(f"{error_msg} - URL: {url}")
-                retry_count += 1
-                if retry_count < max_retries:
-                    await asyncio.sleep(2)
+                    result = await task
+                    if result and result.strip():
+                        content = result
+                        break
+                except Exception as e:
+                    logger.warning(f"API调用失败: {e}")
                     continue
-                else:
-                    return {
-                        "success": False,
-                        "content_indices": [],
-                        "error": error_msg
-                    }
 
-            except Exception as e:
-                error_str = str(e)
-                
-                if "429" in error_str or "rate_limit" in error_str.lower() or "too many requests" in error_str.lower():
-                    logger.warning(f"模型 {current_model} 遇到速率限制 (429)")
-                    
-                    new_model = await self.handle_rate_limit_error(current_model)
-                    rate_limit_cycle_count += 1
-                    
-                    if rate_limit_cycle_count > 0 and rate_limit_cycle_count % len(self.AVAILABLE_MODELS) == 0:
-                        cycle_num = rate_limit_cycle_count // len(self.AVAILABLE_MODELS)
-                        logger.warning(f"所有 {len(self.AVAILABLE_MODELS)} 个模型均遇到限制，第 {cycle_num} 轮轮换，等待后继续...")
-                        await asyncio.sleep(2)
-                    else:
-                        await asyncio.sleep(0.5)
-                    
+            if not content:
+                logger.warning(f"第{attempt + 1}次尝试所有API均失败")
+                await asyncio.sleep(1)
+                continue
+
+            json_str = self.extract_json_from_response(content)
+            if not json_str:
+                logger.error(f"无法从LLM响应中提取JSON, URL: {url}, 原始内容: {content[:200]}")
+                continue
+
+            try:
+                parsed = json.loads(json_str)
+            except json.JSONDecodeError as e:
+                logger.warning(f"JSON解析失败，尝试自动修复: {e}")
+                fixed_json_str = self.fix_json_format(json_str)
+                try:
+                    parsed = json.loads(fixed_json_str)
+                    logger.info("JSON自动修复成功")
+                except json.JSONDecodeError:
                     continue
-                else:
-                    error_msg = f"LLM API调用失败 (模型: {current_model}): {error_str}"
-                    logger.error(f"{error_msg} - URL: {url}")
-                    
-                    retry_count += 1
-                    if retry_count < max_retries:
-                        await asyncio.sleep(2)
-                        continue
-                    else:
-                        return {
-                            "success": False,
-                            "content_indices": [],
-                            "error": error_msg
-                        }
 
-        error_msg = f"LLM API调用失败，已重试 {max_retries} 次"
-        logger.error(f"{error_msg} - URL: {url}")
+            is_success = parsed.get("status") == "success"
+            content_indices = parsed.get("content_indices", [])
+
+            if not content_indices:
+                continue
+
+            if is_success:
+                return {
+                    "success": True,
+                    "content_indices": content_indices,
+                    "error": ""
+                }
+
         return {
             "success": False,
             "content_indices": [],
-            "error": error_msg
+            "error": "所有API尝试均失败"
         }
 
 
