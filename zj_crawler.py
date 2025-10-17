@@ -1367,7 +1367,7 @@ class ZJCrawler:
 
                         for target_city in target_cities:
                             target_city_name = str(target_city).strip()
-                            if not target_city_name or target_city_name == city_name:
+                            if not target_city_name or target_city_name in city_name or city_name in target_city_name:
                                 continue
                             
                             if self.is_city_pair_completed(progress, city_name, target_city_name):
