@@ -2,9 +2,9 @@ bin/
 include/
 lib/
 lib64
-*.log
-*.log*
 browser_cache/
 results/
 models/
 logs/
+crawl_progress.json
+performance_report*
